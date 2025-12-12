@@ -223,7 +223,8 @@ The tracker uses:
 6. ✅ **Covariance Inflation During Maneuvers** - Inflates based on model probability uncertainty
 
 ### High Priority (Remaining)
-1. **Add RMS Error Metrics** - Better performance monitoring (position and velocity errors over time)
+1. **Fix Multi-Target Scaling (3+ Aircraft)** ⚠️ - Make track limits dynamic, improve conflict resolution, adaptive thresholds
+2. **Add RMS Error Metrics** - Better performance monitoring (position and velocity errors over time)
 
 ### Medium Priority (Remaining)
 1. **Model-Specific Likelihoods** - Better model discrimination using individual measurements
@@ -254,6 +255,7 @@ The tracker uses:
    - Targets crossing paths
    - Temporary occlusions
    - High clutter scenarios
+   - **3+ targets** (currently has issues with hardcoded limits)
 
 ## Conclusion
 
@@ -284,12 +286,65 @@ The tracker has been significantly improved with the following fixes:
    - Uses likelihood ratios instead of distance
    - Considers track consistency (confirmed tracks preferred)
 
+### Issues Identified with 3 Aircraft ⚠️
+
+**Status:** Performance degrades with 3 aircraft due to hardcoded parameters and scaling issues
+
+**Identified Problems:**
+
+1. **Hardcoded Track Limits**:
+   - `max_initial_tracks = 2` is hardcoded (should be 3 for 3 aircraft)
+   - `expected_num_tracks` defaults to 2 (should match number of simulated aircraft)
+   - `max_new_tracks_per_step = 1` may be too restrictive for 3 aircraft
+   - Comments still reference "2 aircraft" scenario
+
+2. **Conflict Resolution Scaling**:
+   - Conflict resolution works for 2 tracks but may not scale optimally for 3+
+   - When 3 tracks compete for the same measurement, the greedy assignment (best track wins) may leave other tracks without good associations
+   - No consideration for global assignment optimality (only local per-measurement)
+
+3. **Association Threshold**:
+   - 0.5 threshold for unassociated measurements may be too high for 3 aircraft
+   - With more tracks and clutter, measurements may have lower individual association probabilities even when correctly associated
+   - Threshold should be adaptive based on number of tracks and clutter density
+
+4. **Track Initialization Logic**:
+   - Initialization limits prevent creating the 3rd track initially
+   - `expected_num_tracks` calculation uses `.max(5)` which is confusing and incorrect
+   - Logic assumes 2 aircraft scenario throughout
+
+**Recommended Fixes:**
+
+1. **Make Track Limits Dynamic**:
+   - Pass expected number of aircraft from simulation to tracker
+   - Set `max_initial_tracks` based on expected aircraft count
+   - Set `expected_num_tracks` based on simulation configuration
+   - Adjust `max_new_tracks_per_step` based on number of targets
+
+2. **Improve Multi-Track Conflict Resolution**:
+   - Consider global assignment optimization (Hungarian algorithm or similar)
+   - When multiple tracks compete, consider all possible assignments
+   - Use joint probability of all assignments, not just per-measurement greedy
+
+3. **Adaptive Association Thresholds**:
+   - Lower threshold when more tracks are present (e.g., 0.3 for 3+ tracks)
+   - Consider measurement density and track count
+   - Use track-specific thresholds based on track quality
+
+4. **Better Track Initialization**:
+   - Initialize all expected tracks from first measurements
+   - Use distance-based clustering to identify distinct targets
+   - Ensure minimum separation between initial tracks
+
 ### Remaining Opportunities
-The tracker now performs well for single-target and multi-target scenarios with moderate clutter. Remaining improvements focus on:
+The tracker performs well for single-target and 2-target scenarios with moderate clutter. With 3+ aircraft, performance degrades due to hardcoded parameters. Remaining improvements focus on:
+- **Dynamic track limits** based on expected number of targets
+- **Improved multi-track conflict resolution** (global assignment optimization)
+- **Adaptive association thresholds** based on track count and clutter
 - **Performance monitoring** (RMS error metrics)
 - **Model-specific likelihoods** for better IMM discrimination
 - **Association quality tracking** for adaptive thresholds
 - **State consistency checks** (NIS monitoring)
 
-The implemented fixes address the most critical issues and should significantly improve tracking accuracy, especially for velocity estimation and false track reduction.
+The implemented fixes address the most critical issues for 1-2 targets and should significantly improve tracking accuracy, especially for velocity estimation and false track reduction. However, scaling to 3+ targets requires the additional fixes outlined above.
 
