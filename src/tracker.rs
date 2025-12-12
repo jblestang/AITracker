@@ -185,8 +185,125 @@ impl Tracker {
             return; // Return early on first initialization
         }
         
-        log::debug!("[TRACK UPDATE] Updating {} existing tracks with {} measurements", 
+        log::info!("[TRACK UPDATE] Updating {} existing tracks with {} measurements", 
             self.tracks.len(), measurements.len());
+        
+        // Log all track positions and measurement positions for debugging
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let track_pos = track.state.position();
+            log::info!("[TRACK {}] Position: ({:.1}, {:.1}, {:.1}), Age: {}, Missed: {}", 
+                track.id, track_pos[0], track_pos[1], track_pos[2], track.age, track.missed_detections);
+        }
+        for (meas_idx, measurement) in measurements.iter().enumerate() {
+            log::info!("[MEAS {}] Position: ({:.1}, {:.1}, {:.1})", 
+                meas_idx, measurement.z[0], measurement.z[1], measurement.z[2]);
+        }
+        
+        // For 2 tracks and 2 measurements, check for conflicts and resolve them
+        // This prevents both tracks from associating with the same measurement
+        let mut resolved_associations: Option<Vec<Vec<f64>>> = None;
+        if self.tracks.len() == 2 && measurements.len() == 2 {
+            // Pre-compute association probabilities for all tracks to detect conflicts
+            let filter_for_gating: Box<dyn KalmanFilter> = get_filter(MotionModel::ConstantVelocity);
+            let mut initial_associations: Vec<Vec<f64>> = Vec::new();
+            for track in &self.tracks {
+                let assoc_probs = self.jpda.compute_association_probs(
+                    track,
+                    measurements,
+                    filter_for_gating.as_ref(),
+                    self.dt,
+                );
+                initial_associations.push(assoc_probs);
+            }
+            
+            // Check for conflicts and resolve them
+            let mut has_conflict = false;
+            for meas_idx in 0..measurements.len() {
+                let track0_assoc = initial_associations[0][meas_idx + 1];
+                let track1_assoc = initial_associations[1][meas_idx + 1];
+                
+                // If both tracks have >0.4 association with the same measurement, we have a conflict
+                if track0_assoc > 0.4 && track1_assoc > 0.4 {
+                    has_conflict = true;
+                    log::warn!("[CONFLICT] Both tracks strongly associate with MEAS {} (Track 0: {:.3}, Track 1: {:.3})", 
+                        meas_idx, track0_assoc, track1_assoc);
+                }
+            }
+            
+            // Resolve conflicts by assigning each track to its closest measurement
+            if has_conflict {
+                let mut resolved = initial_associations.clone();
+                let track0_pos = self.tracks[0].state.position();
+                let track1_pos = self.tracks[1].state.position();
+                
+                // Find closest measurement for each track
+                let mut track0_best_meas = 0;
+                let mut track0_best_dist = f64::INFINITY;
+                let mut track1_best_meas = 0;
+                let mut track1_best_dist = f64::INFINITY;
+                
+                for (meas_idx, measurement) in measurements.iter().enumerate() {
+                    let dist0 = (measurement.z - track0_pos).magnitude();
+                    let dist1 = (measurement.z - track1_pos).magnitude();
+                    
+                    if dist0 < track0_best_dist {
+                        track0_best_dist = dist0;
+                        track0_best_meas = meas_idx;
+                    }
+                    if dist1 < track1_best_dist {
+                        track1_best_dist = dist1;
+                        track1_best_meas = meas_idx;
+                    }
+                }
+                
+                // If both tracks want the same measurement, assign to the closer one
+                if track0_best_meas == track1_best_meas {
+                    let meas_pos = measurements[track0_best_meas].z;
+                    let dist0 = (meas_pos - track0_pos).magnitude();
+                    let dist1 = (meas_pos - track1_pos).magnitude();
+                    
+                    if dist0 < dist1 {
+                        // Track 0 gets it, Track 1 gets the other
+                        resolved[0][track0_best_meas + 1] = 0.8;
+                        resolved[0][0] = 0.1;
+                        resolved[0][1 - track0_best_meas + 1] = 0.0;
+                        
+                        resolved[1][track0_best_meas + 1] = 0.0;
+                        resolved[1][1 - track0_best_meas + 1] = 0.8;
+                        resolved[1][0] = 0.1;
+                        log::info!("[CONFLICT RESOLVED] Track 0 gets MEAS {} (closer: {:.1}m vs {:.1}m), Track 1 gets MEAS {}", 
+                            track0_best_meas, dist0, dist1, 1 - track0_best_meas);
+                    } else {
+                        // Track 1 gets it, Track 0 gets the other
+                        resolved[1][track1_best_meas + 1] = 0.8;
+                        resolved[1][0] = 0.1;
+                        resolved[1][1 - track1_best_meas + 1] = 0.0;
+                        
+                        resolved[0][track1_best_meas + 1] = 0.0;
+                        resolved[0][1 - track1_best_meas + 1] = 0.8;
+                        resolved[0][0] = 0.1;
+                        log::info!("[CONFLICT RESOLVED] Track 1 gets MEAS {} (closer: {:.1}m vs {:.1}m), Track 0 gets MEAS {}", 
+                            track1_best_meas, dist1, dist0, 1 - track1_best_meas);
+                    }
+                } else {
+                    // No conflict - tracks want different measurements, but boost their associations
+                    resolved[0][track0_best_meas + 1] = resolved[0][track0_best_meas + 1].max(0.7);
+                    resolved[0][0] = 0.1;
+                    resolved[0][1 - track0_best_meas + 1] = 0.0;
+                    
+                    resolved[1][track1_best_meas + 1] = resolved[1][track1_best_meas + 1].max(0.7);
+                    resolved[1][0] = 0.1;
+                    resolved[1][1 - track1_best_meas + 1] = 0.0;
+                    log::info!("[NO CONFLICT] Track 0 -> MEAS {}, Track 1 -> MEAS {}", 
+                        track0_best_meas, track1_best_meas);
+                }
+                
+                resolved_associations = Some(resolved);
+            } else {
+                // No conflict detected, use original associations
+                resolved_associations = Some(initial_associations);
+            }
+        }
         
         // Update existing tracks
         // Note: We parallelize association probability computation where possible,
@@ -201,12 +318,51 @@ impl Tracker {
             
             // Compute association probabilities using combined state for gating
             let filter_for_gating: Box<dyn KalmanFilter> = get_filter(MotionModel::ConstantVelocity);
-            let association_probs = self.jpda.compute_association_probs(
-                track,
-                measurements,
-                filter_for_gating.as_ref(),
-                self.dt,
-            );
+            let association_probs = if let Some(ref resolved) = resolved_associations {
+                // Use resolved associations if available (for 2 tracks, 2 measurements case)
+                resolved[track_idx].clone()
+            } else {
+                // Normal case: compute associations independently
+                self.jpda.compute_association_probs(
+                    track,
+                    measurements,
+                    filter_for_gating.as_ref(),
+                    self.dt,
+                )
+            };
+            
+            // Log association probabilities for this track
+            log::info!("[TRACK {}] Association probabilities: missed={:.3}", 
+                track.id, association_probs[0]);
+            let track_pos = track.state.position();
+            for (meas_idx, &beta) in association_probs.iter().skip(1).enumerate() {
+                let meas_pos = measurements[meas_idx].z;
+                let distance = (meas_pos - track_pos).magnitude();
+                if beta > 0.01 {
+                    log::info!("[TRACK {}]   -> MEAS {}: prob={:.3}, distance={:.1}m", 
+                        track.id, meas_idx, beta, distance);
+                } else {
+                    log::debug!("[TRACK {}]   -> MEAS {}: prob={:.3}, distance={:.1}m", 
+                        track.id, meas_idx, beta, distance);
+                }
+            }
+            
+            // Find the measurement with highest association probability
+            let max_assoc_idx = association_probs.iter()
+                .enumerate()
+                .skip(1)
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(idx, _)| idx - 1);
+            
+            if let Some(best_meas_idx) = max_assoc_idx {
+                let best_beta = association_probs[best_meas_idx + 1];
+                if best_beta > 0.3 {
+                    let best_meas_pos = measurements[best_meas_idx].z;
+                    let distance_to_best = (best_meas_pos - track_pos).magnitude();
+                    log::info!("[TRACK {}] PRIMARY ASSOCIATION: MEAS {} with prob={:.3}, distance={:.1}m", 
+                        track.id, best_meas_idx, best_beta, distance_to_best);
+                }
+            }
             
             // Step 1: IMM mixing and prediction (before JPDA update)
             let predicted_model_states = imm.mix_and_predict(&current_model_states, self.dt);
@@ -290,6 +446,14 @@ impl Tracker {
         // Step 4: Combine updated model states using updated model probabilities
         let model_probs = imm.model_probs().to_vec();
         let mut combined_state = imm.combine_states(&updated_model_states);
+        
+        // Log the update result
+        let old_pos = track.state.position();
+        let new_pos = combined_state.position();
+        let pos_change = (new_pos - old_pos).magnitude();
+        log::info!("[TRACK {}] Update: old_pos=({:.1}, {:.1}, {:.1}), new_pos=({:.1}, {:.1}, {:.1}), change={:.1}m", 
+            track.id, old_pos[0], old_pos[1], old_pos[2], 
+            new_pos[0], new_pos[1], new_pos[2], pos_change);
         
         // Improve velocity estimation using position history
         // Note: We use prev_track_position which may be from a different track,
@@ -629,6 +793,46 @@ impl Tracker {
                 // For very old tracks, decrease slightly faster
                 if track.age > 50 {
                     track.existence_prob *= 0.97;
+                }
+            }
+        }
+        
+        // Check if tracks are too close together (might be tracking same target)
+        // Also check if tracks are associating with the same measurements
+        if self.tracks.len() >= 2 {
+            for i in 0..self.tracks.len() {
+                for j in (i+1)..self.tracks.len() {
+                    let pos_i = self.tracks[i].state.position();
+                    let pos_j = self.tracks[j].state.position();
+                    let distance = (pos_i - pos_j).magnitude();
+                    if distance < 500.0 {
+                        log::warn!("[TRACK PROXIMITY] Track {} and Track {} are very close: {:.1}m apart - might be tracking same target!", 
+                            self.tracks[i].id, self.tracks[j].id, distance);
+                    }
+                }
+            }
+            
+            // Check if multiple tracks are associating with the same measurement
+            if !measurements.is_empty() {
+                for (meas_idx, measurement) in measurements.iter().enumerate() {
+                    let mut tracks_associating = Vec::new();
+                    for track in &self.tracks {
+                        // Recompute association to see which tracks want this measurement
+                        let filter_for_gating: Box<dyn KalmanFilter> = get_filter(MotionModel::ConstantVelocity);
+                        let assoc_probs = self.jpda.compute_association_probs(
+                            track,
+                            &[measurement.clone()],
+                            filter_for_gating.as_ref(),
+                            self.dt,
+                        );
+                        if assoc_probs.len() > 1 && assoc_probs[1] > 0.3 {
+                            tracks_associating.push((track.id, assoc_probs[1]));
+                        }
+                    }
+                    if tracks_associating.len() > 1 {
+                        log::warn!("[MEASUREMENT CONFLICT] MEAS {} is being associated with {} tracks: {:?}", 
+                            meas_idx, tracks_associating.len(), tracks_associating);
+                    }
                 }
             }
         }
