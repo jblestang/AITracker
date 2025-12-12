@@ -40,6 +40,8 @@ pub struct Tracker {
     min_existence_prob: f64,
     /// Time step
     dt: f64,
+    /// Expected number of targets (from simulation)
+    expected_num_targets: usize,
 }
 
 impl Tracker {
@@ -47,7 +49,8 @@ impl Tracker {
     /// 
     /// # Arguments
     /// * `dt` - Time step
-    pub fn new(dt: f64) -> Self {
+    /// * `expected_num_targets` - Expected number of targets (from simulation)
+    pub fn new(dt: f64, expected_num_targets: usize) -> Self {
         let jpda = JPDA::default();
         
         Self {
@@ -62,7 +65,13 @@ impl Tracker {
             prev_measurement: None,
             prev_track_state: None,
             prev_track_position: None,
+            expected_num_targets,
         }
+    }
+    
+    /// Set expected number of targets (can be updated if simulation changes)
+    pub fn set_expected_num_targets(&mut self, num: usize) {
+        self.expected_num_targets = num;
     }
     
     /// Initialize a new track
@@ -186,17 +195,51 @@ impl Tracker {
         // Otherwise, update existing tracks and then initialize new ones from unassociated measurements
         if self.tracks.is_empty() {
             // Initialize tracks from measurements (up to a limit)
-            // Limit to a reasonable number based on expected targets
-            // For 2 aircraft, we should only initialize 2 tracks
-            let max_initial_tracks = 2; // Initialize up to 2 tracks initially for 2 aircraft
-            log::info!("[TRACK INIT] No existing tracks. Initializing up to {} tracks from {} measurements", 
-                max_initial_tracks, measurements.len());
-            for (i, measurement) in measurements.iter().take(max_initial_tracks).enumerate() {
+            // Limit to expected number of targets
+            let max_initial_tracks = self.expected_num_targets;
+            log::info!("[TRACK INIT] No existing tracks. Initializing up to {} tracks from {} measurements (expected {} targets)", 
+                max_initial_tracks, measurements.len(), self.expected_num_targets);
+            
+            // Use distance-based clustering to select distinct initial measurements
+            // This helps when there are many measurements (clutter + true)
+            let mut selected_measurements = Vec::new();
+            let min_separation = 500.0; // Minimum 500m separation between initial tracks
+            
+            for measurement in measurements.iter() {
+                if selected_measurements.len() >= max_initial_tracks {
+                    break;
+                }
+                
+                // Check if this measurement is far enough from already selected ones
+                let is_far_enough = selected_measurements.iter().all(|(m, _idx): &(Measurement, usize)| {
+                    (measurement.z - m.z).magnitude() >= min_separation
+                });
+                
+                if is_far_enough {
+                    selected_measurements.push((*measurement, selected_measurements.len()));
+                }
+            }
+            
+            // If we don't have enough distinct measurements, take the first N anyway
+            if selected_measurements.len() < max_initial_tracks {
+                for (i, measurement) in measurements.iter().enumerate() {
+                    if selected_measurements.len() >= max_initial_tracks {
+                        break;
+                    }
+                    // Check if not already selected
+                    if !selected_measurements.iter().any(|(m, _idx): &(Measurement, usize)| (m.z - measurement.z).magnitude() < 10.0) {
+                        selected_measurements.push((*measurement, selected_measurements.len()));
+                    }
+                }
+            }
+            
+            for (i, (measurement, _)) in selected_measurements.iter().enumerate() {
                 log::info!("[TRACK INIT] Initializing track {} from measurement at ({:.1}, {:.1}, {:.1})", 
                     i, measurement.z[0], measurement.z[1], measurement.z[2]);
                 self.initialize_track(measurement, time);
             }
-            log::info!("[TRACK INIT] Initialized {} tracks total", self.tracks.len());
+            log::info!("[TRACK INIT] Initialized {} tracks total (expected {})", 
+                self.tracks.len(), self.expected_num_targets);
             // Reset previous track state when initializing new tracks
             self.prev_track_state = None;
             self.prev_track_position = None;
@@ -235,15 +278,20 @@ impl Tracker {
             }
             
             // Check for conflicts: multiple tracks associating with same measurement
-            // Use a lower threshold to catch more conflicts
+            // Adaptive threshold: lower for more tracks (more competition)
+            let conflict_threshold = if self.tracks.len() >= 3 {
+                0.15 // Lower threshold for 3+ tracks
+            } else {
+                0.2 // Standard threshold for 2 tracks
+            };
+            
             let mut has_conflict = false;
             let mut conflict_measurements: Vec<(usize, Vec<(usize, f64)>)> = Vec::new();
             
             for meas_idx in 0..measurements.len() {
                 let mut tracks_associating = Vec::new();
                 for (track_idx, assoc_probs) in initial_associations.iter().enumerate() {
-                    // Lower threshold to catch conflicts earlier (0.2 instead of 0.3)
-                    if assoc_probs[meas_idx + 1] > 0.2 {
+                    if assoc_probs[meas_idx + 1] > conflict_threshold {
                         tracks_associating.push((track_idx, assoc_probs[meas_idx + 1]));
                     }
                 }
@@ -258,66 +306,89 @@ impl Tracker {
                 }
             }
             
-            // Resolve conflicts using likelihood ratios and track consistency
+            // Resolve conflicts using improved assignment for 3+ tracks
             if has_conflict {
                 let mut resolved = initial_associations.clone();
                 let filter_for_gating: Box<dyn KalmanFilter> = get_filter(MotionModel::ConstantVelocity);
                 
-                // For each conflicted measurement, assign to the track with best likelihood
-                for (meas_idx, tracks_associating) in conflict_measurements {
+                // For 3+ tracks, try to balance assignments so each track gets at least one good measurement
+                // Track which measurements have been assigned and which tracks need assignments
+                let mut track_has_good_assignment = vec![false; self.tracks.len()];
+                let mut measurement_assigned = vec![false; measurements.len()];
+                
+                // First pass: assign measurements to tracks that need them most
+                // Sort conflicts by number of competing tracks (handle larger conflicts first)
+                let mut sorted_conflicts: Vec<(usize, Vec<(usize, f64)>)> = conflict_measurements.iter()
+                    .map(|(meas_idx, tracks_associating)| (*meas_idx, tracks_associating.clone()))
+                    .collect();
+                sorted_conflicts.sort_by(|(_, a), (_, b)| b.len().cmp(&a.len()));
+                
+                for (meas_idx, tracks_associating) in sorted_conflicts {
                     if tracks_associating.len() < 2 {
                         continue;
                     }
                     
                     // Compute likelihoods for all competing tracks
-                    let mut track_likelihoods = Vec::new();
-                    for (track_idx, _assoc_prob) in &tracks_associating {
+                    let mut track_scores = Vec::new();
+                    for (track_idx, assoc_prob) in &tracks_associating {
                         let pred = filter_for_gating.predict(&self.tracks[*track_idx].state, self.dt);
                         let likelihood = filter_for_gating.likelihood(&pred, &measurements[meas_idx]);
                         
                         // Consider track consistency (confirmed tracks are preferred)
                         let track_consistent = self.tracks[*track_idx].is_confirmed && 
                                                self.tracks[*track_idx].missed_detections < 3;
-                        let adjusted_likelihood = if track_consistent { likelihood * 1.2 } else { likelihood };
+                        let consistency_bonus = if track_consistent { 1.2 } else { 1.0 };
                         
-                        track_likelihoods.push((*track_idx, adjusted_likelihood, likelihood));
+                        // Penalize tracks that already have good assignments (for 3+ tracks)
+                        let assignment_penalty = if self.tracks.len() >= 3 && track_has_good_assignment[*track_idx] {
+                            0.7 // Reduce score if track already has a good assignment
+                        } else {
+                            1.0
+                        };
+                        
+                        let adjusted_score = likelihood * consistency_bonus * assignment_penalty;
+                        track_scores.push((*track_idx, adjusted_score, likelihood, *assoc_prob));
                     }
                     
-                    // Find track with highest likelihood
-                    let best_track = track_likelihoods.iter()
-                        .max_by(|(_, a, _), (_, b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                        .map(|(idx, _, _)| *idx);
+                    // Find track with highest score
+                    let best_track = track_scores.iter()
+                        .max_by(|(_, a, _, _), (_, b, _, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(idx, _, _, _)| *idx);
                     
                     if let Some(best_idx) = best_track {
-                        // Get the original likelihood for logging
-                        let best_likelihood = track_likelihoods.iter()
-                            .find(|(idx, _, _)| *idx == best_idx)
-                            .map(|(_, _, l)| *l)
+                        let best_score = track_scores.iter()
+                            .find(|(idx, _, _, _)| *idx == best_idx)
+                            .map(|(_, _, l, _)| *l)
                             .unwrap_or(0.0);
                         
-                        // Assign measurement to best track, remove from others
+                        // Assign measurement to best track
                         let best_assoc = initial_associations[best_idx][meas_idx + 1];
                         resolved[best_idx][meas_idx + 1] = (best_assoc * 1.2).min(0.95);
+                        track_has_good_assignment[best_idx] = true;
+                        measurement_assigned[meas_idx] = true;
                         
-                        // Redistribute probabilities: reduce other tracks' associations proportionally
-                        // instead of zeroing them, to avoid causing missed detections
-                        let reduction_factor = 0.3; // Reduce other tracks' associations by 70%
-                        for (track_idx, _, _) in &track_likelihoods {
+                        // Redistribute probabilities: reduce other tracks' associations
+                        // Use adaptive reduction based on number of tracks
+                        let reduction_factor = if self.tracks.len() >= 3 {
+                            0.2 // More aggressive reduction for 3+ tracks (20% of original)
+                        } else {
+                            0.3 // Standard reduction for 2 tracks (30% of original)
+                        };
+                        
+                        for (track_idx, _, _, _) in &track_scores {
                             if *track_idx != best_idx {
-                                // Reduce association probability but don't zero it
                                 resolved[*track_idx][meas_idx + 1] *= reduction_factor;
                             }
                         }
                         
-                        // Normalize all affected tracks to ensure probabilities sum to 1
-                        for (track_idx, _, _) in &track_likelihoods {
+                        // Normalize all affected tracks
+                        for (track_idx, _, _, _) in &track_scores {
                             let sum: f64 = resolved[*track_idx].iter().sum();
                             if sum > 1e-10 {
                                 for prob in &mut resolved[*track_idx] {
                                     *prob /= sum;
                                 }
                             } else {
-                                // If sum is too small, default to missed detection
                                 resolved[*track_idx][0] = 1.0;
                                 for i in 1..resolved[*track_idx].len() {
                                     resolved[*track_idx][i] = 0.0;
@@ -325,8 +396,8 @@ impl Tracker {
                             }
                         }
                         
-                        log::info!("[CONFLICT RESOLVED] Track {} gets MEAS {} (best likelihood: {:.3e})", 
-                            best_idx, meas_idx, best_likelihood);
+                        log::info!("[CONFLICT RESOLVED] Track {} gets MEAS {} (score: {:.3e}, likelihood: {:.3e})", 
+                            best_idx, meas_idx, best_score, best_score);
                     }
                 }
                 
@@ -769,10 +840,19 @@ impl Tracker {
                     .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                     .unwrap_or(0.0);
                 
-                // If max association is low (< 0.5), consider it unassociated
-                // Higher threshold (0.5) to prevent initializing tracks from clutter
-                // For 2 aircraft, we should be very conservative
-                if max_association < 0.5_f64 {
+                // Adaptive threshold based on number of tracks and expected targets
+                // With more tracks, individual association probabilities may be lower
+                // Lower threshold for 3+ tracks to allow proper association
+                let association_threshold = if self.expected_num_targets >= 3 {
+                    0.3 // Lower threshold for 3+ targets
+                } else if self.expected_num_targets == 2 {
+                    0.4 // Medium threshold for 2 targets
+                } else {
+                    0.5 // Higher threshold for 1 target (very conservative)
+                };
+                
+                // If max association is low, consider it unassociated
+                if max_association < association_threshold {
                     log::debug!("[UNASSOC] Measurement {} at ({:.1}, {:.1}, {:.1}) has max_association={:.3} < 0.5", 
                         meas_idx, measurement.z[0], measurement.z[1], measurement.z[2], max_association);
                     Some((meas_idx, measurement.clone()))
@@ -785,17 +865,9 @@ impl Tracker {
             .collect();
         
         // Initialize tracks from unassociated measurements
-        // Get expected number of tracks from simulation (number of aircraft)
-        // For now, use a reasonable default based on number of confirmed tracks
-        // In a real system, this would come from the simulation or sensor
-        let num_confirmed = self.tracks.iter().filter(|t| t.is_confirmed).count();
-        let expected_num_tracks = if num_confirmed > 0 {
-            // If we have confirmed tracks, expect at least that many
-            num_confirmed.max(2) // At least 2 for 2 aircraft scenario
-        } else {
-            // No confirmed tracks yet, use a conservative estimate
-            2 // Default to 2 for 2 aircraft
-        };
+        // Use expected number of targets from simulation
+        let expected_num_tracks = self.expected_num_targets;
+        
         if self.tracks.len() >= expected_num_tracks {
             log::info!("[TRACK INIT] Already have {} tracks (expected {}), skipping new track creation", 
                 self.tracks.len(), expected_num_tracks);
@@ -803,8 +875,13 @@ impl Tracker {
         }
         
         // Limit the number of new tracks per step to avoid explosion
-        // For 2 aircraft, limit to 1 new track per step, and only if we have fewer than expected
-        let max_new_tracks_per_step = 1; // Limit to 1 new track per step for 2 aircraft
+        // Allow more new tracks per step for more targets (but still limit to prevent explosion)
+        let max_new_tracks_per_step = match expected_num_tracks {
+            1 => 1,
+            2 => 1,
+            3..=5 => 2, // Allow 2 new tracks per step for 3-5 targets
+            _ => 3, // Allow 3 for 6+ targets
+        };
         let max_allowed_tracks = expected_num_tracks; // Don't exceed expected number
         let remaining_slots = max_allowed_tracks.saturating_sub(self.tracks.len());
         let num_to_initialize = unassociated_measurements.len()
@@ -894,13 +971,13 @@ mod tests {
     
     #[test]
     fn test_tracker_creation() {
-        let tracker = Tracker::new(1.0);
+        let tracker = Tracker::new(1.0, 1);
         assert_eq!(tracker.tracks.len(), 0);
     }
     
     #[test]
     fn test_track_initialization() {
-        let mut tracker = Tracker::new(1.0);
+        let mut tracker = Tracker::new(1.0, 1);
         let measurement = Measurement::with_default_covariance(
             nalgebra::Vector3::new(100.0, 200.0, 300.0),
             0.0,
@@ -913,7 +990,7 @@ mod tests {
     
     #[test]
     fn test_track_update() {
-        let mut tracker = Tracker::new(1.0);
+        let mut tracker = Tracker::new(1.0, 1);
         let measurement1 = Measurement::with_default_covariance(
             nalgebra::Vector3::new(100.0, 200.0, 300.0),
             0.0,
@@ -935,7 +1012,7 @@ mod tests {
     
     #[test]
     fn test_track_deletion() {
-        let mut tracker = Tracker::new(1.0);
+        let mut tracker = Tracker::new(1.0, 1);
         let measurement = Measurement::with_default_covariance(
             nalgebra::Vector3::new(100.0, 200.0, 300.0),
             0.0,
@@ -954,7 +1031,7 @@ mod tests {
     
     #[test]
     fn test_primary_track() {
-        let mut tracker = Tracker::new(1.0);
+        let mut tracker = Tracker::new(1.0, 1);
         let measurement = Measurement::with_default_covariance(
             nalgebra::Vector3::new(100.0, 200.0, 300.0),
             0.0,

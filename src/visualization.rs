@@ -57,8 +57,9 @@ impl Default for TrackerApp {
     fn default() -> Self {
         let dt = 1.0; // 1 second time step
         // Create simulation with 3 aircraft
-        let simulation = Simulation::new_with_num_aircraft(dt, 10.0, 0.9, 3);
-        let tracker = Tracker::new(dt);
+        let num_aircraft = 3;
+        let simulation = Simulation::new_with_num_aircraft(dt, 10.0, 0.9, num_aircraft);
+        let tracker = Tracker::new(dt, num_aircraft);
         
         Self {
             simulation,
