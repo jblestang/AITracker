@@ -1,0 +1,11 @@
+/Users/jean-baptiste/AITracker/target/debug/deps/ecolor-2c4e0fc546a3cacd.d: /Users/jean-baptiste/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.24.1/src/lib.rs /Users/jean-baptiste/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.24.1/src/color32.rs /Users/jean-baptiste/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.24.1/src/hsva_gamma.rs /Users/jean-baptiste/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.24.1/src/hsva.rs /Users/jean-baptiste/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.24.1/src/rgba.rs
+
+/Users/jean-baptiste/AITracker/target/debug/deps/libecolor-2c4e0fc546a3cacd.rlib: /Users/jean-baptiste/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.24.1/src/lib.rs /Users/jean-baptiste/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.24.1/src/color32.rs /Users/jean-baptiste/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.24.1/src/hsva_gamma.rs /Users/jean-baptiste/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.24.1/src/hsva.rs /Users/jean-baptiste/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.24.1/src/rgba.rs
+
+/Users/jean-baptiste/AITracker/target/debug/deps/libecolor-2c4e0fc546a3cacd.rmeta: /Users/jean-baptiste/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.24.1/src/lib.rs /Users/jean-baptiste/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.24.1/src/color32.rs /Users/jean-baptiste/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.24.1/src/hsva_gamma.rs /Users/jean-baptiste/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.24.1/src/hsva.rs /Users/jean-baptiste/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.24.1/src/rgba.rs
+
+/Users/jean-baptiste/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.24.1/src/lib.rs:
+/Users/jean-baptiste/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.24.1/src/color32.rs:
+/Users/jean-baptiste/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.24.1/src/hsva_gamma.rs:
+/Users/jean-baptiste/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.24.1/src/hsva.rs:
+/Users/jean-baptiste/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.24.1/src/rgba.rs:
