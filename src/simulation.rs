@@ -406,29 +406,30 @@ impl Simulation {
         let mut rng = rand::thread_rng();
         
         // Generate aircraft with random initial positions and velocities
+        // Ensure they are well-separated and on different paths
         for i in 0..num_aircraft {
-            // Spread aircraft across a large area
-            // Use a grid-like distribution with some randomness
-            let grid_size = (num_aircraft as f64).sqrt().ceil() as usize;
-            let x_idx = i % grid_size;
-            let y_idx = i / grid_size;
+            // For 2 aircraft, place them far apart with different headings
+            let separation = 3000.0; // 3km separation for 2 aircraft
+            let angle_step = 2.0 * std::f64::consts::PI / num_aircraft as f64;
             
-            // Base position: spread in a 10km x 10km grid at altitude 5000m
-            let base_x = (x_idx as f64 - grid_size as f64 / 2.0) * 1000.0;
-            let base_y = (y_idx as f64 - grid_size as f64 / 2.0) * 1000.0;
-            let base_z = 5000.0;
+            // Position aircraft in a circle pattern for better separation
+            let angle = i as f64 * angle_step;
+            let base_x = separation * angle.cos();
+            let base_y = separation * angle.sin();
+            let base_z = 5000.0 + (i as f64 * 500.0); // Different altitudes too
             
-            // Add random offset to avoid perfect grid
-            let offset_x = rng.gen_range(-500.0..500.0);
-            let offset_y = rng.gen_range(-500.0..500.0);
-            let offset_z = rng.gen_range(-200.0..200.0);
+            // Add small random offset
+            let offset_x = rng.gen_range(-200.0..200.0);
+            let offset_y = rng.gen_range(-200.0..200.0);
+            let offset_z = rng.gen_range(-100.0..100.0);
             
-            // Random initial velocity (50-150 m/s magnitude)
-            let speed = rng.gen_range(50.0..150.0);
-            let heading = rng.gen_range(0.0..2.0 * std::f64::consts::PI);
+            // Give each aircraft a different heading (perpendicular to position vector)
+            // This ensures they move in different directions
+            let heading = angle + std::f64::consts::PI / 2.0 + rng.gen_range(-0.3..0.3);
+            let speed = rng.gen_range(80.0..120.0); // Reasonable aircraft speed
             let vx = speed * heading.cos();
             let vy = speed * heading.sin();
-            let vz = rng.gen_range(-10.0..10.0);
+            let vz = rng.gen_range(-5.0..5.0);
             
             let x = Vector6::new(
                 base_x + offset_x,

@@ -171,16 +171,22 @@ impl Tracker {
             // Limit to a reasonable number based on expected targets
             // For 2 aircraft, we should only initialize 2 tracks
             let max_initial_tracks = 2; // Initialize up to 2 tracks initially for 2 aircraft
-            log::info!("Initializing up to {} tracks from {} measurements", max_initial_tracks, measurements.len());
-            for measurement in measurements.iter().take(max_initial_tracks) {
+            log::info!("[TRACK INIT] No existing tracks. Initializing up to {} tracks from {} measurements", 
+                max_initial_tracks, measurements.len());
+            for (i, measurement) in measurements.iter().take(max_initial_tracks).enumerate() {
+                log::info!("[TRACK INIT] Initializing track {} from measurement at ({:.1}, {:.1}, {:.1})", 
+                    i, measurement.z[0], measurement.z[1], measurement.z[2]);
                 self.initialize_track(measurement, time);
             }
-            log::info!("Initialized {} tracks", self.tracks.len());
+            log::info!("[TRACK INIT] Initialized {} tracks total", self.tracks.len());
             // Reset previous track state when initializing new tracks
             self.prev_track_state = None;
             self.prev_track_position = None;
             return; // Return early on first initialization
         }
+        
+        log::debug!("[TRACK UPDATE] Updating {} existing tracks with {} measurements", 
+            self.tracks.len(), measurements.len());
         
         // Update existing tracks
         // Note: We parallelize association probability computation where possible,
@@ -681,24 +687,41 @@ impl Tracker {
                     .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                     .unwrap_or(0.0);
                 
-                // If max association is low (< 0.3), consider it unassociated
-                // Higher threshold to prevent initializing tracks from clutter
-                // This threshold prevents initializing tracks from clutter
-                if max_association < 0.3_f64 {
+                // If max association is low (< 0.5), consider it unassociated
+                // Higher threshold (0.5) to prevent initializing tracks from clutter
+                // For 2 aircraft, we should be very conservative
+                if max_association < 0.5_f64 {
+                    log::debug!("[UNASSOC] Measurement {} at ({:.1}, {:.1}, {:.1}) has max_association={:.3} < 0.5", 
+                        meas_idx, measurement.z[0], measurement.z[1], measurement.z[2], max_association);
                     Some((meas_idx, measurement.clone()))
                 } else {
+                    log::debug!("[ASSOC] Measurement {} at ({:.1}, {:.1}, {:.1}) is associated (max_association={:.3})", 
+                        meas_idx, measurement.z[0], measurement.z[1], measurement.z[2], max_association);
                     None
                 }
             })
             .collect();
         
         // Initialize tracks from unassociated measurements
+        // For 2 aircraft, be very conservative: don't create new tracks if we already have 2
+        let expected_num_tracks = 2; // Expected number of tracks for 2 aircraft
+        if self.tracks.len() >= expected_num_tracks {
+            log::info!("[TRACK INIT] Already have {} tracks (expected {}), skipping new track creation", 
+                self.tracks.len(), expected_num_tracks);
+            return;
+        }
+        
         // Limit the number of new tracks per step to avoid explosion
-        // For 2 aircraft, limit to 1 new track per step
+        // For 2 aircraft, limit to 1 new track per step, and only if we have fewer than expected
         let max_new_tracks_per_step = 1; // Limit to 1 new track per step for 2 aircraft
-        let num_to_initialize = unassociated_measurements.len().min(max_new_tracks_per_step);
-        log::debug!("Found {} unassociated measurements, initializing up to {}", 
-            unassociated_measurements.len(), num_to_initialize);
+        let max_allowed_tracks = expected_num_tracks; // Don't exceed expected number
+        let remaining_slots = max_allowed_tracks.saturating_sub(self.tracks.len());
+        let num_to_initialize = unassociated_measurements.len()
+            .min(max_new_tracks_per_step)
+            .min(remaining_slots);
+        
+        log::info!("[TRACK INIT] Found {} unassociated measurements, {} existing tracks, initializing up to {} new tracks", 
+            unassociated_measurements.len(), self.tracks.len(), num_to_initialize);
         
         // Parallelize distance checking for remaining measurements
         let tracks_ref = &self.tracks;
@@ -725,9 +748,10 @@ impl Tracker {
         
         // Initialize tracks from valid measurements
         for measurement in valid_measurements {
-            log::debug!("Initializing new track from unassociated measurement at ({:.2}, {:.2}, {:.2})", 
-                measurement.z[0], measurement.z[1], measurement.z[2]);
+            log::info!("[TRACK INIT] Initializing new track {} from unassociated measurement at ({:.1}, {:.1}, {:.1})", 
+                self.tracks.len() + 1, measurement.z[0], measurement.z[1], measurement.z[2]);
             self.initialize_track(&measurement, time);
+            log::info!("[TRACK INIT] Now have {} tracks total", self.tracks.len());
         }
     }
     
@@ -738,15 +762,27 @@ impl Tracker {
         
         for (idx, track) in self.tracks.iter().enumerate() {
             if track.should_delete(self.max_missed_detections, self.min_existence_prob) {
+                log::info!("[TRACK DELETE] Marking track {} for deletion (age={}, missed={}, existence={:.3})", 
+                    track.id, track.age, track.missed_detections, track.existence_prob);
                 to_delete.push(idx);
             }
         }
         
+        if !to_delete.is_empty() {
+            log::info!("[TRACK DELETE] Deleting {} tracks (had {} total)", to_delete.len(), self.tracks.len());
+        }
+        
         // Delete in reverse order to maintain indices
         for &idx in to_delete.iter().rev() {
+            let track_id = self.tracks[idx].id;
             self.tracks.remove(idx);
             self.imm_filters.remove(idx);
             self.model_states.remove(idx);
+            log::info!("[TRACK DELETE] Deleted track {}", track_id);
+        }
+        
+        if !to_delete.is_empty() {
+            log::info!("[TRACK DELETE] Now have {} tracks remaining", self.tracks.len());
         }
     }
     
