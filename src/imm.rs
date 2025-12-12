@@ -301,6 +301,14 @@ impl IMM {
         &self.model_probs
     }
     
+    /// Set model probabilities (for reconstruction during parallel processing)
+    pub fn set_model_probs(&mut self, probs: &[f64]) {
+        let sum: f64 = probs.iter().sum();
+        if sum > 1e-10 {
+            self.model_probs = probs.iter().map(|&p| p / sum).collect();
+        }
+    }
+    
     /// Update model probabilities directly (public method for external control)
     pub fn update_model_probs_direct(&mut self, likelihoods: &[f64]) {
         self.update_model_probs(likelihoods);

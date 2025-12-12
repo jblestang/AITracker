@@ -9,10 +9,12 @@
 //! primary target) and updates them using the IMM-JPDA framework.
 
 use nalgebra::Vector3;
+use rayon::prelude::*;
 use crate::state::{State, Measurement, Track, MotionModel};
 use crate::imm::IMM;
 use crate::jpda::JPDA;
 use crate::kalman::{KalmanFilter, get_filter};
+
 
 /// Main tracker implementation
 pub struct Tracker {
@@ -177,6 +179,194 @@ impl Tracker {
             return; // Return early on first initialization
         }
         
+        // Update existing tracks
+        // Note: We parallelize association probability computation where possible,
+        // but IMM updates must remain sequential due to trait object constraints
+        for (track_idx, track) in self.tracks.iter_mut().enumerate() {
+            // Get IMM filter and model states for this track
+            let imm = &mut self.imm_filters[track_idx];
+            let current_model_states = self.model_states[track_idx].clone();
+            
+            // Get filters for each model
+            let models = MotionModel::all();
+            
+            // Compute association probabilities using combined state for gating
+            let filter_for_gating: Box<dyn KalmanFilter> = get_filter(MotionModel::ConstantVelocity);
+            let association_probs = self.jpda.compute_association_probs(
+                track,
+                measurements,
+                filter_for_gating.as_ref(),
+                self.dt,
+            );
+            
+            // Step 1: IMM mixing and prediction (before JPDA update)
+            let predicted_model_states = imm.mix_and_predict(&current_model_states, self.dt);
+        
+        // Step 2: Compute likelihoods on PREDICTED states (before update)
+        // This is critical for correct model probability updates
+        let mut likelihoods = Vec::new();
+        let mut measurement_for_likelihood: Option<Measurement> = None;
+        
+        if !measurements.is_empty() {
+            // Create weighted measurement from JPDA for likelihood computation
+            let mut weighted_z = Vector3::zeros();
+            let mut total_weight = 0.0;
+            for (i, measurement) in measurements.iter().enumerate() {
+                let beta = association_probs[i + 1];
+                if beta > 1e-6 {
+                    weighted_z += beta * measurement.z;
+                    total_weight += beta;
+                }
+            }
+            if total_weight > 1e-6 {
+                weighted_z /= total_weight;
+                let base_r = measurements[0].R;
+                let r_adjustment = (1.0 / total_weight).min(5.0);
+                let r = base_r * r_adjustment;
+                measurement_for_likelihood = Some(Measurement::new(weighted_z, r, measurements[0].time));
+            }
+        }
+        
+        // Compute likelihoods for each model using PREDICTED states
+        if let Some(ref meas) = measurement_for_likelihood {
+            for (model_idx, predicted_state) in predicted_model_states.iter().enumerate() {
+                let model_filter: Box<dyn KalmanFilter> = get_filter(models[model_idx]);
+                let likelihood = model_filter.likelihood(predicted_state, meas);
+                likelihoods.push(likelihood);
+            }
+            // Update model probabilities based on predicted state likelihoods
+            imm.update_model_probs_direct(&likelihoods);
+        } else {
+            // No measurement - keep current probabilities
+            likelihoods = vec![1.0; models.len()];
+        }
+        
+        // Step 3: Update each predicted model state with JPDA
+        let mut updated_model_states = Vec::new();
+        let mut was_updated = false;
+        
+        // Check if we have a valid association (not just missed detection)
+        let has_valid_association = association_probs.len() > 1 && {
+            let total_association: f64 = association_probs.iter().skip(1).sum();
+            total_association > 0.1 // At least 10% association probability
+        };
+        
+        for (model_idx, predicted_state) in predicted_model_states.iter().enumerate() {
+            // Create a temporary track with predicted state for JPDA update
+            let mut temp_track = track.clone();
+            temp_track.state = *predicted_state;
+            
+            // Get appropriate filter for this model
+            let model_filter: Box<dyn KalmanFilter> = get_filter(models[model_idx]);
+            
+            // Update this model's predicted state with JPDA
+            let (updated_state, updated) = self.jpda.update_track(
+                &temp_track,
+                measurements,
+                &association_probs,
+                model_filter.as_ref(),
+                self.dt,
+            );
+            updated_model_states.push(updated_state);
+            was_updated = was_updated || updated;
+        }
+        
+        // Consider it an update if we have valid association OR if track is very young
+        let effective_update = if track.age < 5 {
+            was_updated || has_valid_association
+        } else {
+            was_updated
+        };
+        
+        // Step 4: Combine updated model states using updated model probabilities
+        let model_probs = imm.model_probs().to_vec();
+        let mut combined_state = imm.combine_states(&updated_model_states);
+        
+        // Improve velocity estimation using position history
+        // Note: We use prev_track_position which may be from a different track,
+        // but this is the current design
+        if let Some((prev_pos, prev_time)) = &self.prev_track_position {
+            let dt_actual = (time - prev_time).max(0.1);
+            
+            if dt_actual > 0.0 && dt_actual < 10.0 {
+                // Compute velocity directly from position change
+                let current_pos = combined_state.position();
+                let pos_diff = current_pos - prev_pos;
+                let estimated_vel = pos_diff / dt_actual;
+                
+                // Blend estimated velocity with filter velocity
+                let blend_factor = if track.age < 5 {
+                    0.9
+                } else if track.age < 15 {
+                    0.7
+                } else {
+                    0.5
+                };
+                
+                // Update velocity
+                combined_state.x[3] = blend_factor * estimated_vel[0] + (1.0 - blend_factor) * combined_state.x[3];
+                combined_state.x[4] = blend_factor * estimated_vel[1] + (1.0 - blend_factor) * combined_state.x[4];
+                combined_state.x[5] = blend_factor * estimated_vel[2] + (1.0 - blend_factor) * combined_state.x[5];
+                
+                // Update velocity covariance
+                let vel_uncertainty = 50.0;
+                combined_state.P[(3, 3)] = (combined_state.P[(3, 3)] * (1.0 - blend_factor) + vel_uncertainty * blend_factor).min(300.0);
+                combined_state.P[(4, 4)] = (combined_state.P[(4, 4)] * (1.0 - blend_factor) + vel_uncertainty * blend_factor).min(300.0);
+                combined_state.P[(5, 5)] = (combined_state.P[(5, 5)] * (1.0 - blend_factor) + vel_uncertainty * blend_factor).min(300.0);
+                
+                // Maintain cross-covariance
+                let cross_cov = 150.0;
+                combined_state.P[(0, 3)] = cross_cov;
+                combined_state.P[(3, 0)] = cross_cov;
+                combined_state.P[(1, 4)] = cross_cov;
+                combined_state.P[(4, 1)] = cross_cov;
+                combined_state.P[(2, 5)] = cross_cov;
+                combined_state.P[(5, 2)] = cross_cov;
+            }
+        } else if effective_update && !measurements.is_empty() {
+            // First update - estimate velocity from measurement if available
+            if let Some(prev_meas) = &self.prev_measurement {
+                let dt_meas = (time - prev_meas.time).max(0.1);
+                if dt_meas > 0.0 && dt_meas < 5.0 {
+                    let pos_diff = combined_state.position() - prev_meas.z;
+                    let estimated_vel = pos_diff / dt_meas;
+                    combined_state.x[3] = estimated_vel[0];
+                    combined_state.x[4] = estimated_vel[1];
+                    combined_state.x[5] = estimated_vel[2];
+                }
+            }
+        }
+        
+            // Update track
+            track.state = combined_state;
+            track.model_probs = model_probs;
+            track.age += 1;
+            track.last_update_time = time;
+            
+            // Store current state and position for next velocity estimation
+            self.prev_track_state = Some(combined_state);
+            self.prev_track_position = Some((combined_state.position(), time));
+            
+            // Store updated model states
+            self.model_states[track_idx] = updated_model_states;
+            
+            if effective_update {
+                track.missed_detections = 0;
+                // Increase existence probability more aggressively when updated
+                track.existence_prob = (track.existence_prob * 0.9 + 0.1).min(1.0);
+            } else {
+                track.missed_detections += 1;
+                // Decrease existence probability very slowly - only for very old tracks
+                // For young tracks (age < 10), don't decrease existence at all
+                if track.age > 10 {
+                    track.existence_prob *= 0.98; // Very slow decrease
+                }
+                // For very old tracks, decrease slightly faster
+                if track.age > 50 {
+                    track.existence_prob *= 0.97;
+                }
+            }
+        }
         // Update existing tracks
         for (track_idx, track) in self.tracks.iter_mut().enumerate() {
             // Get IMM filter and model states for this track
@@ -458,58 +648,79 @@ impl Tracker {
         
         // For each measurement, check if it's associated with any existing track
         // A measurement is unassociated if its max association probability with any track is low
-        let mut unassociated_measurements = Vec::new();
+        // Parallelize this check for better performance
+        let tracks_ref = &self.tracks;
+        let jpda_ref = &self.jpda;
+        let dt = self.dt;
         
-        for (meas_idx, measurement) in measurements.iter().enumerate() {
-            let mut max_association: f64 = 0.0;
-            
-            // Check association with all existing tracks
-            for track in &self.tracks {
-                let filter_for_gating: Box<dyn KalmanFilter> = get_filter(MotionModel::ConstantVelocity);
-                let association_probs = self.jpda.compute_association_probs(
-                    track,
-                    &[measurement.clone()], // Single measurement
-                    filter_for_gating.as_ref(),
-                    self.dt,
-                );
+        let unassociated_measurements: Vec<(usize, Measurement)> = measurements
+            .par_iter()
+            .enumerate()
+            .filter_map(|(meas_idx, measurement)| {
+                let max_association: f64 = tracks_ref
+                    .par_iter()
+                    .map(|track| {
+                        let filter_for_gating: Box<dyn KalmanFilter> = get_filter(MotionModel::ConstantVelocity);
+                        let association_probs = jpda_ref.compute_association_probs(
+                            track,
+                            &[measurement.clone()], // Single measurement
+                            filter_for_gating.as_ref(),
+                            dt,
+                        );
+                        
+                        // Get association probability for this measurement (skip missed detection prob)
+                        if association_probs.len() > 1 {
+                            association_probs[1] // First measurement prob
+                        } else {
+                            0.0
+                        }
+                    })
+                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .unwrap_or(0.0);
                 
-                // Get association probability for this measurement (skip missed detection prob)
-                if association_probs.len() > 1 {
-                    let meas_association = association_probs[1]; // First measurement prob
-                    max_association = max_association.max(meas_association);
+                // If max association is low (< 0.3), consider it unassociated
+                // This threshold prevents initializing tracks from clutter
+                if max_association < 0.3_f64 {
+                    Some((meas_idx, measurement.clone()))
+                } else {
+                    None
                 }
-            }
-            
-            // If max association is low (< 0.3), consider it unassociated
-            // This threshold prevents initializing tracks from clutter
-            if max_association < 0.3_f64 {
-                unassociated_measurements.push((meas_idx, measurement.clone()));
-            }
-        }
+            })
+            .collect();
         
         // Initialize tracks from unassociated measurements
         // Limit the number of new tracks per step to avoid explosion
         let max_new_tracks_per_step = 10;
         let num_to_initialize = unassociated_measurements.len().min(max_new_tracks_per_step);
         
-        for (_, measurement) in unassociated_measurements.iter().take(num_to_initialize) {
-            // Additional check: only initialize if measurement is not too close to existing tracks
-            // This prevents duplicate tracks for the same target
-            let mut too_close = false;
-            for track in &self.tracks {
-                let distance = (measurement.z - track.state.position()).magnitude();
-                // If within 200m of existing track, don't initialize
-                if distance < 200.0 {
-                    too_close = true;
-                    break;
-                }
-            }
-            
-            if !too_close {
-                log::debug!("Initializing new track from unassociated measurement at ({:.2}, {:.2}, {:.2})", 
-                    measurement.z[0], measurement.z[1], measurement.z[2]);
-                self.initialize_track(measurement, time);
-            }
+        // Parallelize distance checking for remaining measurements
+        let tracks_ref = &self.tracks;
+        let measurements_to_check: Vec<Measurement> = unassociated_measurements
+            .iter()
+            .take(num_to_initialize)
+            .map(|(_, m)| m.clone())
+            .collect();
+        
+        let valid_measurements: Vec<Measurement> = measurements_to_check
+            .par_iter()
+            .filter(|measurement| {
+                // Check if measurement is not too close to any existing track
+                let too_close = tracks_ref
+                    .par_iter()
+                    .any(|track| {
+                        let distance = (measurement.z - track.state.position()).magnitude();
+                        distance < 200.0 // If within 200m of existing track, too close
+                    });
+                !too_close
+            })
+            .cloned()
+            .collect();
+        
+        // Initialize tracks from valid measurements
+        for measurement in valid_measurements {
+            log::debug!("Initializing new track from unassociated measurement at ({:.2}, {:.2}, {:.2})", 
+                measurement.z[0], measurement.z[1], measurement.z[2]);
+            self.initialize_track(&measurement, time);
         }
     }
     

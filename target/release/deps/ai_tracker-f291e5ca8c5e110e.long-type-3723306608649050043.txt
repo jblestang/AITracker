@@ -1,0 +1,1 @@
+rayon::iter::Map<rayon::vec::IntoIter<(usize, Track, std::vec::Vec<f64>, std::vec::Vec<state::State>)>, {closure@src/tracker.rs:203:18: 203:73}>
