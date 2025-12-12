@@ -236,7 +236,7 @@ impl Tracker {
             
             // Check for conflicts: multiple tracks associating with same measurement
             let mut has_conflict = false;
-            let mut conflict_measurements = Vec::new();
+            let mut conflict_measurements: Vec<(usize, Vec<(usize, f64)>)> = Vec::new();
             
             for meas_idx in 0..measurements.len() {
                 let mut tracks_associating = Vec::new();
@@ -247,10 +247,12 @@ impl Tracker {
                 }
                 if tracks_associating.len() > 1 {
                     has_conflict = true;
-                    conflict_measurements.push((meas_idx, tracks_associating));
+                    let tracks_info: Vec<String> = tracks_associating.iter()
+                        .map(|(i, p)| format!("Track{}:{:.3}", i, p))
+                        .collect();
                     log::warn!("[CONFLICT] MEAS {} has {} tracks associating: {:?}", 
-                        meas_idx, tracks_associating.len(), 
-                        tracks_associating.iter().map(|(i, p)| format!("Track{}:{:.3}", i, p)).collect::<Vec<_>>());
+                        meas_idx, tracks_associating.len(), tracks_info);
+                    conflict_measurements.push((meas_idx, tracks_associating));
                 }
             }
             
@@ -285,6 +287,12 @@ impl Tracker {
                         .map(|(idx, _, _)| *idx);
                     
                     if let Some(best_idx) = best_track {
+                        // Get the original likelihood for logging
+                        let best_likelihood = track_likelihoods.iter()
+                            .find(|(idx, _, _)| *idx == best_idx)
+                            .map(|(_, _, l)| *l)
+                            .unwrap_or(0.0);
+                        
                         // Assign measurement to best track, remove from others
                         let best_assoc = initial_associations[best_idx][meas_idx + 1];
                         resolved[best_idx][meas_idx + 1] = (best_assoc * 1.2).min(0.95);
@@ -307,10 +315,7 @@ impl Tracker {
                         }
                         
                         log::info!("[CONFLICT RESOLVED] Track {} gets MEAS {} (best likelihood: {:.3e})", 
-                            best_idx, meas_idx, track_likelihoods.iter()
-                                .find(|(idx, _, _)| *idx == best_idx)
-                                .map(|(_, _, l)| *l)
-                                .unwrap_or(0.0));
+                            best_idx, meas_idx, best_likelihood);
                     }
                 }
                 
