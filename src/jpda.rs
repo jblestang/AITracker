@@ -48,7 +48,13 @@ impl JPDA {
     pub fn default() -> Self {
         // Use larger gate threshold initially to help with velocity=0 issue
         // 9.0 = 3-sigma, but we need larger for initial tracking
-        Self::new(0.9, 0.01, 16.0) // pd=0.9, low clutter, 4-sigma gate (larger for better association)
+        // lambda_fa should match actual clutter density (1e-8 per m^3)
+        // But we need to account for gate volume, so use a value that works with typical gate volumes
+        // For a typical gate volume of ~1e6 m^3, lambda_fa * V_g should give reasonable expected_fa
+        // With lambda_fa = 1e-8 and V_g = 1e6, expected_fa = 0.01 (very low)
+        // But if we use lambda_fa = 1e-8 directly, expected_fa might be too small
+        // Use a slightly higher value to account for view-adaptive clutter generation
+        Self::new(0.9, 1e-8, 16.0) // pd=0.9, match clutter density 1e-8, 4-sigma gate
     }
     
     /// Compute gate volume for a track
@@ -265,6 +271,8 @@ impl JPDA {
         
         // Scale expected_fa and missed term by exp(-max_log_likelihood) to match scale
         // Use a more conservative threshold to avoid numerical issues
+        // The key insight: if likelihoods are very small, expected_fa should also be scaled down
+        // But we need to be careful not to make expected_fa dominate when it shouldn't
         let scale_factor = if max_log_likelihood > -30.0 {
             (-max_log_likelihood).exp()
         } else {
@@ -273,7 +281,17 @@ impl JPDA {
             (-30.0_f64).exp() // Use exp(-30) ≈ 9.36e-14 as a safe scale
         };
         
-        let scaled_expected_fa = expected_fa * scale_factor;
+        // Scale expected_fa: if likelihoods are small, expected_fa should be proportionally small
+        // But we also need to account for the fact that expected_fa is already in "per gate" units
+        // The issue is that expected_fa might be too large relative to likelihoods
+        // For very small likelihoods, we should reduce expected_fa's influence
+        let scaled_expected_fa = if max_log_likelihood < -50.0 {
+            // If likelihoods are extremely small, reduce expected_fa influence
+            expected_fa * scale_factor * 0.1 // Reduce by 90% for very small likelihoods
+        } else {
+            expected_fa * scale_factor
+        };
+        
         let scaled_missed_term = if self.pd > 1e-10 {
             (1.0 - self.pd) / self.pd * scale_factor
         } else {

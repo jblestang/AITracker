@@ -235,13 +235,15 @@ impl Tracker {
             }
             
             // Check for conflicts: multiple tracks associating with same measurement
+            // Use a lower threshold to catch more conflicts
             let mut has_conflict = false;
             let mut conflict_measurements: Vec<(usize, Vec<(usize, f64)>)> = Vec::new();
             
             for meas_idx in 0..measurements.len() {
                 let mut tracks_associating = Vec::new();
                 for (track_idx, assoc_probs) in initial_associations.iter().enumerate() {
-                    if assoc_probs[meas_idx + 1] > 0.3 {
+                    // Lower threshold to catch conflicts earlier (0.2 instead of 0.3)
+                    if assoc_probs[meas_idx + 1] > 0.2 {
                         tracks_associating.push((track_idx, assoc_probs[meas_idx + 1]));
                     }
                 }
@@ -297,19 +299,28 @@ impl Tracker {
                         let best_assoc = initial_associations[best_idx][meas_idx + 1];
                         resolved[best_idx][meas_idx + 1] = (best_assoc * 1.2).min(0.95);
                         
-                        // Remove association from other tracks
+                        // Redistribute probabilities: reduce other tracks' associations proportionally
+                        // instead of zeroing them, to avoid causing missed detections
+                        let reduction_factor = 0.3; // Reduce other tracks' associations by 70%
                         for (track_idx, _, _) in &track_likelihoods {
                             if *track_idx != best_idx {
-                                resolved[*track_idx][meas_idx + 1] = 0.0;
+                                // Reduce association probability but don't zero it
+                                resolved[*track_idx][meas_idx + 1] *= reduction_factor;
                             }
                         }
                         
-                        // Normalize all affected tracks
+                        // Normalize all affected tracks to ensure probabilities sum to 1
                         for (track_idx, _, _) in &track_likelihoods {
                             let sum: f64 = resolved[*track_idx].iter().sum();
                             if sum > 1e-10 {
                                 for prob in &mut resolved[*track_idx] {
                                     *prob /= sum;
+                                }
+                            } else {
+                                // If sum is too small, default to missed detection
+                                resolved[*track_idx][0] = 1.0;
+                                for i in 1..resolved[*track_idx].len() {
+                                    resolved[*track_idx][i] = 0.0;
                                 }
                             }
                         }
@@ -339,8 +350,8 @@ impl Tracker {
             
             // Compute association probabilities using combined state for gating
             let filter_for_gating: Box<dyn KalmanFilter> = get_filter(MotionModel::ConstantVelocity);
-            let association_probs = if let Some(ref resolved) = resolved_associations {
-                // Use resolved associations if available (for 2 tracks, 2 measurements case)
+            let mut association_probs = if let Some(ref resolved) = resolved_associations {
+                // Use resolved associations if available (for conflict resolution)
                 resolved[track_idx].clone()
             } else {
                 // Normal case: compute associations independently
@@ -351,6 +362,16 @@ impl Tracker {
                     self.dt,
                 )
             };
+            
+            // Ensure association probabilities are valid (sum to 1, all non-negative)
+            let sum: f64 = association_probs.iter().sum();
+            if sum > 1e-10 && (sum - 1.0).abs() > 0.01 {
+                // Renormalize if sum is significantly different from 1.0
+                for prob in &mut association_probs {
+                    *prob /= sum;
+                }
+                log::debug!("[TRACK {}] Renormalized association probabilities (sum was {:.4})", track.id, sum);
+            }
             
             // Log association probabilities for this track
             log::info!("[TRACK {}] Association probabilities: missed={:.3}", 
@@ -764,8 +785,17 @@ impl Tracker {
             .collect();
         
         // Initialize tracks from unassociated measurements
-        // For 2 aircraft, be very conservative: don't create new tracks if we already have 2
-        let expected_num_tracks = 2; // Expected number of tracks for 2 aircraft
+        // Get expected number of tracks from simulation (number of aircraft)
+        // For now, use a reasonable default based on number of confirmed tracks
+        // In a real system, this would come from the simulation or sensor
+        let num_confirmed = self.tracks.iter().filter(|t| t.is_confirmed).count();
+        let expected_num_tracks = if num_confirmed > 0 {
+            // If we have confirmed tracks, expect at least that many
+            num_confirmed.max(2) // At least 2 for 2 aircraft scenario
+        } else {
+            // No confirmed tracks yet, use a conservative estimate
+            2 // Default to 2 for 2 aircraft
+        };
         if self.tracks.len() >= expected_num_tracks {
             log::info!("[TRACK INIT] Already have {} tracks (expected {}), skipping new track creation", 
                 self.tracks.len(), expected_num_tracks);

@@ -226,7 +226,7 @@ impl ClutterGenerator {
     pub fn default() -> Self {
         // Default surveillance volume: 10km x 10km x 5km
         let bounds = [-5000.0, 5000.0, -5000.0, 5000.0, 0.0, 10000.0];
-        let density = 1e-2; // Clutter density
+        let density = 1e-8; // Clutter density (matches user requirement)
         
         Self::new(bounds, density)
     }

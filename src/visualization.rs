@@ -135,13 +135,47 @@ impl TrackerApp {
                 self.true_history.push(*first_state);
             }
             
-            // Generate clutter in view bounds (view-adaptive)
-            // This ensures clutter density is constant regardless of zoom level
-            // Note: We'll generate clutter based on current view when drawing
-            // For now, generate minimal clutter to avoid performance issues
+            // Generate clutter around current aircraft positions (view-adaptive)
+            // Use a reasonable surveillance volume around the aircraft
+            // For 2 aircraft, generate clutter in a volume that includes both
+            let mut bounds_min = Vector3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+            let mut bounds_max = Vector3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
             
-            // Update tracker
-            self.tracker.update(&measurements, time);
+            // Find bounding box around all aircraft
+            for state in &true_states {
+                let pos = state.position();
+                bounds_min[0] = bounds_min[0].min(pos[0] - 2000.0);
+                bounds_min[1] = bounds_min[1].min(pos[1] - 2000.0);
+                bounds_min[2] = bounds_min[2].min(pos[2] - 1000.0);
+                bounds_max[0] = bounds_max[0].max(pos[0] + 2000.0);
+                bounds_max[1] = bounds_max[1].max(pos[1] + 2000.0);
+                bounds_max[2] = bounds_max[2].max(pos[2] + 1000.0);
+            }
+            
+            // If no aircraft, use default bounds
+            if bounds_min[0] == f64::INFINITY {
+                bounds_min = Vector3::new(-5000.0, -5000.0, 0.0);
+                bounds_max = Vector3::new(5000.0, 5000.0, 10000.0);
+            }
+            
+            let clutter = self.simulation.generate_clutter_in_bounds(
+                time,
+                10.0, // measurement_noise_std
+                bounds_min,
+                bounds_max,
+            );
+            
+            let clutter_count = clutter.len();
+            
+            // Combine true measurements with clutter for tracker
+            let mut all_measurements = measurements.clone();
+            all_measurements.extend(clutter);
+            
+            log::debug!("[MEASUREMENTS] True: {}, Clutter: {}, Total: {}", 
+                measurements.len(), clutter_count, all_measurements.len());
+            
+            // Update tracker with all measurements (true + clutter)
+            self.tracker.update(&all_measurements, time);
             
             self.measurement_history.push(measurements);
             
