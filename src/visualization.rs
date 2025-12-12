@@ -65,7 +65,7 @@ impl Default for TrackerApp {
             measurement_history: Vec::new(),
             running: true, // Auto-play at startup
             speed: 1,
-            auto_stop_after_steps: Some(100), // Auto-stop after 100 steps for analysis
+            auto_stop_after_steps: Some(10000), // Auto-stop after 100 steps for analysis
             view_center: Vector3::new(0.0, 0.0, 5000.0),
             view_scale: 0.1, // Smaller scale for better visibility
             view_offset: egui::Vec2::ZERO,
