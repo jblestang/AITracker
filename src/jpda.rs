@@ -63,11 +63,16 @@ impl JPDA {
     /// # Returns
     /// Gate volume
     fn gate_volume(&self, S: &Matrix3<f64>) -> f64 {
+        self.gate_volume_with_threshold(S, self.gate_threshold)
+    }
+    
+    /// Compute gate volume with custom threshold
+    fn gate_volume_with_threshold(&self, S: &Matrix3<f64>, threshold: f64) -> f64 {
         // Volume of ellipsoid: V = (4/3) * pi * sqrt(det(S)) * chi^1.5
-        // For 3D, simplified: V = (4/3) * pi * sqrt(det(S)) * (gate_threshold)^1.5
+        // For 3D, simplified: V = (4/3) * pi * sqrt(det(S)) * (threshold)^1.5
         let det_S = S.determinant();
         if det_S > 1e-10 {
-            (4.0 / 3.0) * std::f64::consts::PI * det_S.sqrt() * self.gate_threshold.powf(1.5)
+            (4.0 / 3.0) * std::f64::consts::PI * det_S.sqrt() * threshold.powf(1.5)
         } else {
             0.0
         }
@@ -85,9 +90,22 @@ impl JPDA {
     /// # Returns
     /// True if measurement is in gate
     fn in_gate(&self, innovation: &Vector3<f64>, S: &Matrix3<f64>) -> bool {
+        self.in_gate_with_threshold(innovation, S, self.gate_threshold)
+    }
+    
+    /// Check if measurement is in gate with custom threshold
+    /// 
+    /// # Arguments
+    /// * `innovation` - Innovation vector (z - H*x)
+    /// * `S` - Innovation covariance matrix
+    /// * `threshold` - Gate threshold (chi-squared value)
+    /// 
+    /// # Returns
+    /// True if measurement is in gate
+    fn in_gate_with_threshold(&self, innovation: &Vector3<f64>, S: &Matrix3<f64>, threshold: f64) -> bool {
         if let Some(S_inv) = S.try_inverse() {
             let d_squared = innovation.transpose() * S_inv * innovation;
-            d_squared[0] <= self.gate_threshold
+            d_squared[0] <= threshold
         } else {
             false
         }
@@ -125,10 +143,26 @@ impl JPDA {
         // Use default measurement covariance if no measurements
         let default_R = nalgebra::Matrix3::identity() * 100.0;
         let R = measurements.first().map(|m| m.R).unwrap_or(default_R);
-        let S = H * predicted_state.P * H.transpose() + R;
+        let mut S = H * predicted_state.P * H.transpose() + R;
         
-        // Compute gate volume
-        let V_g = self.gate_volume(&S);
+        // Adaptive gate threshold: use larger gates for young tracks
+        // Young tracks have more uncertainty, so need larger gates
+        let adaptive_gate_threshold = if track.age < 5 {
+            self.gate_threshold * 1.5 // 50% larger gate for tracks < 5 steps old
+        } else if track.age < 10 {
+            self.gate_threshold * 1.2 // 20% larger for tracks < 10 steps old
+        } else {
+            self.gate_threshold // Normal gate for mature tracks
+        };
+        
+        // Also inflate covariance for young tracks to account for uncertainty
+        if track.age < 5 {
+            let inflation_factor = 1.5;
+            S = S * inflation_factor;
+        }
+        
+        // Compute gate volume with adaptive threshold
+        let V_g = self.gate_volume_with_threshold(&S, adaptive_gate_threshold);
         let expected_fa = self.lambda_fa * V_g; // Expected number of false alarms in gate
         
         log::debug!("JPDA compute_association_probs:");
@@ -147,7 +181,8 @@ impl JPDA {
         for (i, measurement) in measurements.iter().enumerate() {
             let innovation = measurement.z - H * predicted_state.x;
             let innovation_mag = innovation.magnitude();
-            let in_gate = self.in_gate(&innovation, &S);
+            // Use adaptive gate threshold
+            let in_gate = self.in_gate_with_threshold(&innovation, &S, adaptive_gate_threshold);
             in_gate_flags.push(in_gate);
             
             log::debug!("  Measurement {}: pos=({:.2}, {:.2}, {:.2}), innovation_mag={:.2}, in_gate={}", 

@@ -81,22 +81,35 @@ impl Tracker {
         x[1] = measurement.z[1];
         x[2] = measurement.z[2];
         
-        // Try to estimate initial velocity from previous measurement if available
-        log::debug!("Initializing track {} at time {:.2}", self.next_track_id, time);
-        log::debug!("  Measurement position: ({:.2}, {:.2}, {:.2})", measurement.z[0], measurement.z[1], measurement.z[2]);
+        // Improved velocity estimation: use least-squares fit if we have measurement history
+        log::info!("[TRACK INIT] Initializing track {} at time {:.2}", self.next_track_id, time);
+        log::info!("  Measurement position: ({:.2}, {:.2}, {:.2})", measurement.z[0], measurement.z[1], measurement.z[2]);
+        
+        // Try to estimate velocity using least-squares from recent measurements
+        let mut estimated_velocity = Vector3::zeros();
+        let mut has_velocity_estimate = false;
         
         if let Some(prev_meas) = &self.prev_measurement {
-            let dt_meas = (measurement.time - prev_meas.time).max(0.1); // Avoid division by zero
-            log::debug!("  Previous measurement available at time {:.2}, dt: {:.2}", prev_meas.time, dt_meas);
-            if dt_meas > 0.0 {
-                // Estimate velocity from position difference
-                x[3] = (measurement.z[0] - prev_meas.z[0]) / dt_meas;
-                x[4] = (measurement.z[1] - prev_meas.z[1]) / dt_meas;
-                x[5] = (measurement.z[2] - prev_meas.z[2]) / dt_meas;
-                log::debug!("  Estimated initial velocity: ({:.2}, {:.2}, {:.2})", x[3], x[4], x[5]);
+            let dt_meas = (measurement.time - prev_meas.time).max(0.1);
+            if dt_meas > 0.0 && dt_meas < 10.0 {
+                // Simple two-point estimate
+                estimated_velocity = (measurement.z - prev_meas.z) / dt_meas;
+                has_velocity_estimate = true;
+                log::info!("  Two-point velocity estimate: ({:.2}, {:.2}, {:.2}) m/s", 
+                    estimated_velocity[0], estimated_velocity[1], estimated_velocity[2]);
             }
+        }
+        
+        // If we have measurement history, use least-squares fit for better estimate
+        // This would require storing measurement history, which we'll add to Track
+        // For now, use the two-point estimate if available
+        
+        if has_velocity_estimate {
+            x[3] = estimated_velocity[0];
+            x[4] = estimated_velocity[1];
+            x[5] = estimated_velocity[2];
         } else {
-            log::debug!("  No previous measurement - velocity initialized to zero");
+            log::info!("  No velocity estimate available - initializing to zero");
         }
         
         // Initial covariance: position uncertainty from measurement, velocity uncertainty larger
@@ -105,9 +118,12 @@ impl Tracker {
         P[(1, 1)] = measurement.R[(1, 1)];
         P[(2, 2)] = measurement.R[(2, 2)];
         
-        // Velocity uncertainty: larger if we estimated it, even larger if we didn't
-        let vel_uncertainty = if self.prev_measurement.is_some() {
-            200.0 // Estimated velocity - moderate uncertainty
+        // Velocity uncertainty: adaptive based on estimation quality
+        let vel_uncertainty = if has_velocity_estimate {
+            // Estimated velocity - moderate uncertainty, scaled by time step
+            let dt = (measurement.time - self.prev_measurement.unwrap().time).max(0.1);
+            // Uncertainty increases with time step (less reliable for larger dt)
+            (200.0 * (1.0 + dt / 2.0)).min(500.0)
         } else {
             1000.0 // No velocity estimate - large uncertainty
         };
@@ -116,9 +132,9 @@ impl Tracker {
         P[(5, 5)] = vel_uncertainty;
         
         // Cross-covariance terms (position-velocity correlation)
-        // This helps the filter learn velocity from position measurements
-        // Use larger cross-covariance to ensure velocity gets updated
-        let cross_cov = 200.0; // Increased from 100.0
+        // Increased cross-covariance to help velocity convergence
+        // Scale with velocity uncertainty for better correlation
+        let cross_cov = (vel_uncertainty * 0.5).min(300.0).max(200.0);
         P[(0, 3)] = cross_cov;
         P[(3, 0)] = cross_cov;
         P[(1, 4)] = cross_cov;
@@ -128,12 +144,14 @@ impl Tracker {
         
         let initial_state = State::new(x, P);
         
-        // Create IMM filter
+        // Create IMM filter with adaptive transition probabilities
         let imm = IMM::default();
         let num_models = imm.model_probs().len();
         
-        // Create track
-        let track = Track::new(self.next_track_id, initial_state, num_models, time);
+        // Create track (starts as tentative, will be confirmed with M/N logic)
+        let mut track = Track::new(self.next_track_id, initial_state, num_models, time);
+        track.add_measurement(measurement.z, time);
+        track.increment_scan();
         self.next_track_id += 1;
         
         // Initialize model-conditioned states (one per model)
@@ -143,7 +161,7 @@ impl Tracker {
         self.imm_filters.push(imm);
         self.model_states.push(model_states);
         
-        log::debug!("Track {} initialized with velocity: ({:.2}, {:.2}, {:.2})", 
+        log::info!("[TRACK INIT] Track {} initialized with velocity: ({:.2}, {:.2}, {:.2}) m/s", 
             self.next_track_id - 1, x[3], x[4], x[5]);
     }
     
@@ -525,6 +543,18 @@ impl Tracker {
                 track.missed_detections = 0;
                 // Increase existence probability more aggressively when updated
                 track.existence_prob = (track.existence_prob * 0.9 + 0.1).min(1.0);
+                
+                // Add measurement to history for velocity estimation (M/N logic)
+                if let Some(best_meas_idx) = association_probs.iter()
+                    .enumerate()
+                    .skip(1)
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(idx, _)| idx - 1)
+                {
+                    if best_meas_idx < measurements.len() && association_probs[best_meas_idx + 1] > 0.3 {
+                        track.add_measurement(measurements[best_meas_idx].z, time);
+                    }
+                }
             } else {
                 track.missed_detections += 1;
                 // Decrease existence probability very slowly - only for very old tracks
@@ -536,6 +566,83 @@ impl Tracker {
                 if track.age > 50 {
                     track.existence_prob *= 0.97;
                 }
+            }
+            
+            // Increment scan counter for M/N logic
+            track.increment_scan();
+            
+            // Check M/N confirmation (M=2 detections out of N=3 scans)
+            if !track.is_confirmed && track.should_confirm(2, 3) {
+                track.is_confirmed = true;
+                log::info!("[TRACK CONFIRM] Track {} confirmed ({} detections in {} scans)", 
+                    track.id, track.num_detections, track.num_scans);
+            }
+            
+            // Improve velocity estimation using measurement history (least-squares)
+            if track.measurement_history.len() >= 2 && !track.measurement_history.is_empty() {
+                // Use least-squares to estimate velocity from position history
+                let positions: Vec<Vector3<f64>> = track.measurement_history.iter()
+                    .map(|(pos, _)| *pos).collect();
+                let times: Vec<f64> = track.measurement_history.iter()
+                    .map(|(_, t)| *t).collect();
+                
+                // Simple least-squares: fit line to positions vs time
+                let n = positions.len() as f64;
+                let sum_t: f64 = times.iter().sum();
+                
+                // For each dimension, compute velocity = sum((t - t_mean) * (pos - pos_mean)) / sum((t - t_mean)^2)
+                let t_mean = sum_t / n;
+                let mut vel_estimate = Vector3::zeros();
+                
+                for dim in 0..3 {
+                    let sum_pos: f64 = positions.iter().map(|p| p[dim]).sum();
+                    let pos_mean = sum_pos / n;
+                    
+                    let mut numerator = 0.0;
+                    let mut denominator = 0.0;
+                    for i in 0..positions.len() {
+                        let t_diff = times[i] - t_mean;
+                        let pos_diff = positions[i][dim] - pos_mean;
+                        numerator += t_diff * pos_diff;
+                        denominator += t_diff * t_diff;
+                    }
+                    
+                    if denominator > 1e-6 {
+                        vel_estimate[dim] = numerator / denominator;
+                    }
+                }
+                
+                // Blend velocity estimate with filter estimate (more weight on history for young tracks)
+                let blend_factor = if track.age < 5 {
+                    0.7 // 70% weight on history-based estimate for young tracks
+                } else {
+                    0.3 // 30% weight for mature tracks
+                };
+                
+                let filter_vel = track.state.velocity();
+                let blended_vel = blend_factor * vel_estimate + (1.0 - blend_factor) * filter_vel;
+                
+                // Update velocity in state
+                track.state.x[3] = blended_vel[0];
+                track.state.x[4] = blended_vel[1];
+                track.state.x[5] = blended_vel[2];
+                
+                log::debug!("[VEL EST] Track {}: history={:.2?}, filter={:.2?}, blended={:.2?}", 
+                    track.id, vel_estimate, filter_vel, blended_vel);
+            }
+            
+            // Covariance inflation during maneuvers (when model probabilities are changing)
+            let model_prob_variance: f64 = track.model_probs.iter()
+                .map(|p| (p - 1.0 / track.model_probs.len() as f64).powi(2))
+                .sum();
+            let model_uncertainty = model_prob_variance.sqrt();
+            
+            // Inflate covariance if model probabilities are uncertain (indicating maneuver)
+            if model_uncertainty > 0.15 { // High uncertainty = maneuver
+                let inflation_factor = 1.0 + model_uncertainty * 0.5; // Up to 50% inflation
+                track.state.P = track.state.P * inflation_factor;
+                log::debug!("[COV INFLATION] Track {}: uncertainty={:.3}, inflation={:.2}", 
+                    track.id, model_uncertainty, inflation_factor);
             }
         }
         // Update existing tracks
@@ -860,11 +967,16 @@ impl Tracker {
         let jpda_ref = &self.jpda;
         let dt = self.dt;
         
+        // Only consider confirmed tracks for association (M/N logic)
+        let confirmed_tracks: Vec<&Track> = tracks_ref.iter()
+            .filter(|track| track.is_confirmed)
+            .collect();
+        
         let unassociated_measurements: Vec<(usize, Measurement)> = measurements
             .par_iter()
             .enumerate()
             .filter_map(|(meas_idx, measurement)| {
-                let max_association: f64 = tracks_ref
+                let max_association: f64 = confirmed_tracks
                     .par_iter()
                     .map(|track| {
                         let filter_for_gating: Box<dyn KalmanFilter> = get_filter(MotionModel::ConstantVelocity);

@@ -71,15 +71,23 @@ impl IMM {
         // Uniform initial probabilities
         let initial_probs = vec![1.0 / num_models as f64; num_models];
         
-        // Transition matrix: high probability of staying in same model,
-        // small probability of switching
+        // Adaptive transition matrix: high probability of staying in same model,
+        // but allow more switching between CV and CA/CT based on motion characteristics
         let mut transition_matrix = vec![vec![0.0; num_models]; num_models];
         for i in 0..num_models {
             for j in 0..num_models {
                 if i == j {
-                    transition_matrix[i][j] = 0.95; // Stay in same model
+                    transition_matrix[i][j] = 0.90; // Stay in same model (slightly lower for more adaptability)
                 } else {
-                    transition_matrix[i][j] = 0.025; // Switch to other model
+                    // Prefer transitions between similar models (CV <-> CA, CA <-> CT)
+                    // CV (0) <-> CA (1) is more likely than CV <-> CT
+                    if (i == 0 && j == 1) || (i == 1 && j == 0) {
+                        transition_matrix[i][j] = 0.05; // CV <-> CA
+                    } else if (i == 1 && j == 2) || (i == 2 && j == 1) {
+                        transition_matrix[i][j] = 0.05; // CA <-> CT
+                    } else {
+                        transition_matrix[i][j] = 0.025; // CV <-> CT (less likely)
+                    }
                 }
             }
         }

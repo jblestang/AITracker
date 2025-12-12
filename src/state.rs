@@ -125,6 +125,14 @@ pub struct Track {
     pub existence_prob: f64,
     /// Last update time
     pub last_update_time: f64,
+    /// Track confirmation status (M/N logic: M detections out of N scans)
+    pub is_confirmed: bool,
+    /// Number of detections received (for M/N confirmation)
+    pub num_detections: usize,
+    /// Number of scans since track creation (for M/N confirmation)
+    pub num_scans: usize,
+    /// Measurement history for velocity estimation (last 3 measurements)
+    pub measurement_history: Vec<(Vector3<f64>, f64)>, // (position, time)
 }
 
 impl Track {
@@ -141,7 +149,36 @@ impl Track {
             missed_detections: 0,
             existence_prob: 0.5, // Initial existence probability
             last_update_time: time,
+            is_confirmed: false, // Start as tentative
+            num_detections: 0,
+            num_scans: 0,
+            measurement_history: Vec::new(),
         }
+    }
+    
+    /// Check if track should be confirmed (M/N logic)
+    /// M detections out of N scans required for confirmation
+    pub fn should_confirm(&self, m: usize, n: usize) -> bool {
+        if self.is_confirmed {
+            return true; // Already confirmed
+        }
+        // Require at least M detections in the last N scans
+        self.num_detections >= m && self.num_scans >= n
+    }
+    
+    /// Add a measurement to history (for velocity estimation)
+    pub fn add_measurement(&mut self, position: Vector3<f64>, time: f64) {
+        self.measurement_history.push((position, time));
+        // Keep only last 3 measurements
+        if self.measurement_history.len() > 3 {
+            self.measurement_history.remove(0);
+        }
+        self.num_detections += 1;
+    }
+    
+    /// Increment scan counter
+    pub fn increment_scan(&mut self) {
+        self.num_scans += 1;
     }
     
     /// Check if track should be deleted
