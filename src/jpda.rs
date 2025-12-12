@@ -204,6 +204,17 @@ impl JPDA {
             f64::NEG_INFINITY
         };
         
+        // If all likelihoods are extremely small (max_log_likelihood < -100),
+        // treat as missed detection to avoid numerical issues
+        if max_log_likelihood < -100.0 {
+            log::debug!("  All likelihoods extremely small (max_log={:.2}), defaulting to missed detection", max_log_likelihood);
+            association_probs.push(1.0);
+            for _ in 0..measurements.len() {
+                association_probs.push(0.0);
+            }
+            return association_probs;
+        }
+        
         // Convert back to linear space with numerical stability
         // likelihood_j_normalized = exp(log_likelihood_j - max_log_likelihood)
         let mut normalized_likelihoods = Vec::new();
@@ -218,13 +229,13 @@ impl JPDA {
         let sum_normalized_likelihoods: f64 = normalized_likelihoods.iter().sum();
         
         // Scale expected_fa and missed term by exp(-max_log_likelihood) to match scale
-        // But if max_log_likelihood is very negative, this would cause overflow
-        // Instead, use a threshold: if max_log_likelihood < -50, treat likelihoods as negligible
-        let scale_factor = if max_log_likelihood > -50.0 {
+        // Use a more conservative threshold to avoid numerical issues
+        let scale_factor = if max_log_likelihood > -30.0 {
             (-max_log_likelihood).exp()
         } else {
-            // Likelihoods are extremely small, use a fixed small scale
-            1e-20
+            // Likelihoods are very small, but not negligible
+            // Use a scale that prevents overflow but maintains relative magnitudes
+            (-30.0_f64).exp() // Use exp(-30) ≈ 9.36e-14 as a safe scale
         };
         
         let scaled_expected_fa = expected_fa * scale_factor;

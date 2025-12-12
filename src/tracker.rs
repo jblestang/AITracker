@@ -167,13 +167,15 @@ impl Tracker {
         // If we have no tracks, initialize tracks from measurements
         // Otherwise, update existing tracks and then initialize new ones from unassociated measurements
         if self.tracks.is_empty() {
-            // Initialize multiple tracks from measurements (up to a limit)
-            // This handles the initial case with many targets
-            // For 100 targets, initialize more tracks initially
-            let max_initial_tracks = 100; // Initialize up to 100 tracks initially
+            // Initialize tracks from measurements (up to a limit)
+            // Limit to a reasonable number based on expected targets
+            // For 2 aircraft, we should only initialize a few tracks (2-5)
+            let max_initial_tracks = 5; // Initialize up to 5 tracks initially
+            log::info!("Initializing up to {} tracks from {} measurements", max_initial_tracks, measurements.len());
             for measurement in measurements.iter().take(max_initial_tracks) {
                 self.initialize_track(measurement, time);
             }
+            log::info!("Initialized {} tracks", self.tracks.len());
             // Reset previous track state when initializing new tracks
             self.prev_track_state = None;
             self.prev_track_position = None;
@@ -238,8 +240,8 @@ impl Tracker {
             // Update model probabilities based on predicted state likelihoods
             imm.update_model_probs_direct(&likelihoods);
         } else {
-            // No measurement - keep current probabilities
-            likelihoods = vec![1.0; models.len()];
+            // No measurement - keep current probabilities (don't update model probs)
+            // likelihoods remains empty, which is fine
         }
         
         // Step 3: Update each predicted model state with JPDA
@@ -424,8 +426,8 @@ impl Tracker {
                 // Update model probabilities based on predicted state likelihoods
                 imm.update_model_probs_direct(&likelihoods);
             } else {
-                // No measurement - keep current probabilities
-                likelihoods = vec![1.0; models.len()];
+                // No measurement - keep current probabilities (don't update model probs)
+                // likelihoods remains empty, which is fine
             }
             
             // Step 3: Update each predicted model state with JPDA
@@ -679,10 +681,10 @@ impl Tracker {
                     .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                     .unwrap_or(0.0);
                 
-                // If max association is low (< 0.2), consider it unassociated
-                // Lower threshold to initialize more tracks (was 0.3)
+                // If max association is low (< 0.3), consider it unassociated
+                // Higher threshold to prevent initializing tracks from clutter
                 // This threshold prevents initializing tracks from clutter
-                if max_association < 0.2_f64 {
+                if max_association < 0.3_f64 {
                     Some((meas_idx, measurement.clone()))
                 } else {
                     None
@@ -692,9 +694,11 @@ impl Tracker {
         
         // Initialize tracks from unassociated measurements
         // Limit the number of new tracks per step to avoid explosion
-        // For 100 targets, allow more new tracks per step
-        let max_new_tracks_per_step = 20; // Increased from 10 to track more targets
+        // For 2 aircraft, limit to 2-3 new tracks per step
+        let max_new_tracks_per_step = 3; // Limit to 3 new tracks per step for 2 aircraft
         let num_to_initialize = unassociated_measurements.len().min(max_new_tracks_per_step);
+        log::debug!("Found {} unassociated measurements, initializing up to {}", 
+            unassociated_measurements.len(), num_to_initialize);
         
         // Parallelize distance checking for remaining measurements
         let tracks_ref = &self.tracks;
