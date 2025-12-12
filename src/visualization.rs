@@ -286,6 +286,108 @@ impl eframe::App for TrackerApp {
             ctx.request_repaint();
         }
         
+        // Left panel with statistics
+        egui::SidePanel::left("stats_panel")
+            .resizable(true)
+            .default_width(200.0)
+            .show(ctx, |ui| {
+                ui.heading("Statistics");
+                ui.separator();
+                
+                // Track statistics
+                let tracks = self.tracker.tracks();
+                let num_tracks = tracks.len();
+                let num_true_targets = self.current_true_states.len();
+                
+                ui.label(egui::RichText::new("Tracking").strong());
+                ui.label(format!("Active Tracks: {}", num_tracks));
+                ui.label(format!("True Targets: {}", num_true_targets));
+                
+                // Track-to-target ratio
+                let track_ratio = if num_true_targets > 0 {
+                    (num_tracks as f64 / num_true_targets as f64) * 100.0
+                } else {
+                    0.0
+                };
+                ui.label(format!("Track Ratio: {:.1}%", track_ratio));
+                
+                // Average track age
+                if !tracks.is_empty() {
+                    let avg_age: f64 = tracks.iter().map(|t| t.age as f64).sum::<f64>() / tracks.len() as f64;
+                    ui.label(format!("Avg Track Age: {:.1} steps", avg_age));
+                    
+                    // Oldest track
+                    if let Some(oldest) = tracks.iter().max_by_key(|t| t.age) {
+                        ui.label(format!("Oldest Track: {} steps", oldest.age));
+                    }
+                    
+                    // Average missed detections
+                    let avg_missed: f64 = tracks.iter().map(|t| t.missed_detections as f64).sum::<f64>() / tracks.len() as f64;
+                    ui.label(format!("Avg Missed: {:.1}", avg_missed));
+                    
+                    // Average existence probability
+                    let avg_existence: f64 = tracks.iter().map(|t| t.existence_prob).sum::<f64>() / tracks.len() as f64;
+                    ui.label(format!("Avg Existence: {:.2}", avg_existence));
+                }
+                
+                ui.separator();
+                
+                // Measurement statistics
+                ui.label(egui::RichText::new("Measurements").strong());
+                let total_measurements: usize = self.measurement_history.iter().map(|m| m.len()).sum();
+                ui.label(format!("Total Received: {}", total_measurements));
+                
+                if !self.measurement_history.is_empty() {
+                    let avg_per_step: f64 = total_measurements as f64 / self.measurement_history.len() as f64;
+                    ui.label(format!("Avg per Step: {:.1}", avg_per_step));
+                    
+                    // Current step measurements
+                    if let Some(current) = self.measurement_history.last() {
+                        ui.label(format!("Current Step: {}", current.len()));
+                    }
+                }
+                
+                ui.separator();
+                
+                // Simulation statistics
+                ui.label(egui::RichText::new("Simulation").strong());
+                ui.label(format!("Time: {:.1} s", self.simulation.time()));
+                ui.label(format!("Steps: {}", self.step_counter));
+                
+                if let Some(max_steps) = self.auto_stop_after_steps {
+                    ui.label(format!("Auto-stop: {} steps", max_steps));
+                }
+                
+                ui.separator();
+                
+                // Performance indicators
+                ui.label(egui::RichText::new("Performance").strong());
+                
+                // Track coverage (how many targets are being tracked)
+                if num_true_targets > 0 {
+                    let coverage = (num_tracks as f64 / num_true_targets as f64 * 100.0).min(100.0);
+                    let coverage_color = if coverage > 80.0 {
+                        egui::Color32::from_rgb(0, 255, 0) // Green
+                    } else if coverage > 50.0 {
+                        egui::Color32::from_rgb(255, 255, 0) // Yellow
+                    } else {
+                        egui::Color32::from_rgb(255, 0, 0) // Red
+                    };
+                    ui.label(egui::RichText::new(format!("Coverage: {:.1}%", coverage)).color(coverage_color));
+                }
+                
+                // Track quality (based on existence probability)
+                if !tracks.is_empty() {
+                    let high_quality = tracks.iter().filter(|t| t.existence_prob > 0.7).count();
+                    let medium_quality = tracks.iter().filter(|t| t.existence_prob > 0.3 && t.existence_prob <= 0.7).count();
+                    let low_quality = tracks.iter().filter(|t| t.existence_prob <= 0.3).count();
+                    
+                    ui.label(format!("High Quality: {}", high_quality));
+                    ui.label(format!("Medium Quality: {}", medium_quality));
+                    ui.label(format!("Low Quality: {}", low_quality));
+                }
+            });
+        
         // Right panel with tracks list
         egui::SidePanel::right("tracks_panel")
             .resizable(true)
