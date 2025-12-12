@@ -162,18 +162,19 @@ impl Tracker {
             self.prev_measurement = Some(*first_meas);
         }
         
-        // Only initialize new track if we truly have no tracks
-        // Don't reinitialize immediately after deletion - wait a bit
+        // If we have no tracks, initialize tracks from measurements
+        // Otherwise, update existing tracks and then initialize new ones from unassociated measurements
         if self.tracks.is_empty() {
-            // Only initialize if we have measurements and haven't had a track recently
-            // This prevents immediate reinitialization after deletion
-            if let Some(first_meas) = measurements.first() {
-                self.initialize_track(first_meas, time);
-                // Reset previous track state when initializing new track
-                self.prev_track_state = None;
-                self.prev_track_position = None;
+            // Initialize multiple tracks from measurements (up to a limit)
+            // This handles the initial case with many targets
+            let max_initial_tracks = 50; // Limit initial tracks to avoid explosion
+            for measurement in measurements.iter().take(max_initial_tracks) {
+                self.initialize_track(measurement, time);
             }
-            return;
+            // Reset previous track state when initializing new tracks
+            self.prev_track_state = None;
+            self.prev_track_position = None;
+            return; // Return early on first initialization
         }
         
         // Update existing tracks
@@ -435,6 +436,81 @@ impl Tracker {
         
         // Delete tracks that should be deleted
         self.delete_tracks();
+        
+        // Step 4: Initialize new tracks from unassociated measurements
+        // For multi-target tracking, we need to create tracks for measurements
+        // that are not well-associated with existing tracks
+        self.initialize_new_tracks_from_unassociated(measurements, time);
+    }
+    
+    /// Initialize new tracks from unassociated measurements
+    /// 
+    /// A measurement is considered unassociated if it has low association probability
+    /// with all existing tracks (i.e., it's likely a new target or clutter).
+    /// 
+    /// # Arguments
+    /// * `measurements` - All measurements (true + clutter)
+    /// * `time` - Current time
+    fn initialize_new_tracks_from_unassociated(&mut self, measurements: &[Measurement], time: f64) {
+        if measurements.is_empty() {
+            return;
+        }
+        
+        // For each measurement, check if it's associated with any existing track
+        // A measurement is unassociated if its max association probability with any track is low
+        let mut unassociated_measurements = Vec::new();
+        
+        for (meas_idx, measurement) in measurements.iter().enumerate() {
+            let mut max_association: f64 = 0.0;
+            
+            // Check association with all existing tracks
+            for track in &self.tracks {
+                let filter_for_gating: Box<dyn KalmanFilter> = get_filter(MotionModel::ConstantVelocity);
+                let association_probs = self.jpda.compute_association_probs(
+                    track,
+                    &[measurement.clone()], // Single measurement
+                    filter_for_gating.as_ref(),
+                    self.dt,
+                );
+                
+                // Get association probability for this measurement (skip missed detection prob)
+                if association_probs.len() > 1 {
+                    let meas_association = association_probs[1]; // First measurement prob
+                    max_association = max_association.max(meas_association);
+                }
+            }
+            
+            // If max association is low (< 0.3), consider it unassociated
+            // This threshold prevents initializing tracks from clutter
+            if max_association < 0.3_f64 {
+                unassociated_measurements.push((meas_idx, measurement.clone()));
+            }
+        }
+        
+        // Initialize tracks from unassociated measurements
+        // Limit the number of new tracks per step to avoid explosion
+        let max_new_tracks_per_step = 10;
+        let num_to_initialize = unassociated_measurements.len().min(max_new_tracks_per_step);
+        
+        for (_, measurement) in unassociated_measurements.iter().take(num_to_initialize) {
+            // Additional check: only initialize if measurement is not too close to existing tracks
+            // This prevents duplicate tracks for the same target
+            let mut too_close = false;
+            for track in &self.tracks {
+                let distance = (measurement.z - track.state.position()).magnitude();
+                // If within 200m of existing track, don't initialize
+                if distance < 200.0 {
+                    too_close = true;
+                    break;
+                }
+            }
+            
+            if !too_close {
+                log::debug!("Initializing new track from unassociated measurement at ({:.2}, {:.2}, {:.2})", 
+                    measurement.z[0], measurement.z[1], measurement.z[2]);
+                self.initialize_track(measurement, time);
+            }
+        }
     }
     
     
