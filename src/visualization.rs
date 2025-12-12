@@ -56,8 +56,8 @@ pub struct TrackerApp {
 impl Default for TrackerApp {
     fn default() -> Self {
         let dt = 1.0; // 1 second time step
-        // Create simulation with 1000 aircraft
-        let simulation = Simulation::new_with_num_aircraft(dt, 10.0, 0.9, 1000);
+        // Create simulation with 100 aircraft
+        let simulation = Simulation::new_with_num_aircraft(dt, 10.0, 0.9, 100);
         let tracker = Tracker::new(dt);
         
         Self {
