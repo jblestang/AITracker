@@ -413,7 +413,7 @@ impl Tracker {
         // Check if we have a valid association (not just missed detection)
         let has_valid_association = association_probs.len() > 1 && {
             let total_association: f64 = association_probs.iter().skip(1).sum();
-            total_association > 0.1 // At least 10% association probability
+            total_association > 0.05 // At least 5% association probability (lowered from 0.1)
         };
         
         for (model_idx, predicted_state) in predicted_model_states.iter().enumerate() {
@@ -436,12 +436,10 @@ impl Tracker {
             was_updated = was_updated || updated;
         }
         
-        // Consider it an update if we have valid association OR if track is very young
-        let effective_update = if track.age < 5 {
-            was_updated || has_valid_association
-        } else {
-            was_updated
-        };
+        // Consider it an update if we have valid association OR if JPDA updated
+        // Be more lenient: count any association > 5% as an update, not just when JPDA returns updated=true
+        // This prevents missed detections from accumulating when tracks have weak but valid associations
+        let effective_update = was_updated || has_valid_association;
         
         // Step 4: Combine updated model states using updated model probabilities
         let model_probs = imm.model_probs().to_vec();
@@ -607,7 +605,7 @@ impl Tracker {
             // Check if we have a valid association (not just missed detection)
             let has_valid_association = association_probs.len() > 1 && {
                 let total_association: f64 = association_probs.iter().skip(1).sum();
-                total_association > 0.1 // At least 10% association probability
+                total_association > 0.05 // At least 5% association probability (lowered from 0.1)
             };
             
             // DEBUG: Log association probabilities
@@ -646,14 +644,10 @@ impl Tracker {
                     model_idx, updated, updated_state.x[0], updated_state.x[1], updated_state.x[2]);
             }
             
-            // Consider it an update if we have valid association OR if track is very young
-            // This helps young tracks survive initial uncertainty
-            // For young tracks, be more lenient - consider partial associations as updates
-            let effective_update = if track.age < 5 {
-                was_updated || has_valid_association
-            } else {
-                was_updated
-            };
+            // Consider it an update if we have valid association OR if JPDA updated
+            // Be more lenient: count any association > 5% as an update
+            // This prevents missed detections from accumulating when tracks have weak but valid associations
+            let effective_update = was_updated || has_valid_association;
             
             // Step 4: Combine updated model states using updated model probabilities
             let model_probs = imm.model_probs().to_vec();
