@@ -405,36 +405,51 @@ impl Simulation {
         let mut aircraft = Vec::new();
         let mut rng = rand::thread_rng();
         
-        // Generate aircraft with random initial positions and velocities
-        // Ensure they are well-separated and on different paths
+        // Generate aircraft with completely random initial positions and velocities
+        // For multiple aircraft, ensure minimum separation to avoid starting too close
+        let mut positions = Vec::new();
+        let min_separation = 1000.0; // Minimum 1km separation between aircraft
+        
         for i in 0..num_aircraft {
-            // For 2 aircraft, place them far apart with different headings
-            let separation = 3000.0; // 3km separation for 2 aircraft
-            let angle_step = 2.0 * std::f64::consts::PI / num_aircraft as f64;
+            let mut attempts = 0;
+            let mut valid_position = false;
+            let mut base_x = 0.0;
+            let mut base_y = 0.0;
+            let mut base_z = 0.0;
             
-            // Position aircraft in a circle pattern for better separation
-            let angle = i as f64 * angle_step;
-            let base_x = separation * angle.cos();
-            let base_y = separation * angle.sin();
-            let base_z = 5000.0 + (i as f64 * 500.0); // Different altitudes too
+            // Try to find a random position that's not too close to existing aircraft
+            while !valid_position && attempts < 100 {
+                base_x = rng.gen_range(-5000.0..5000.0);
+                base_y = rng.gen_range(-5000.0..5000.0);
+                base_z = rng.gen_range(2000.0..8000.0); // Random altitude
+                
+                // Check separation from existing aircraft
+                valid_position = positions.iter().all(|(px, py, pz): &(f64, f64, f64)| {
+                    let dx = base_x - px;
+                    let dy = base_y - py;
+                    let dz = base_z - pz;
+                    let distance = (dx * dx + dy * dy + dz * dz).sqrt();
+                    distance >= min_separation
+                });
+                
+                attempts += 1;
+            }
             
-            // Add small random offset
-            let offset_x = rng.gen_range(-200.0..200.0);
-            let offset_y = rng.gen_range(-200.0..200.0);
-            let offset_z = rng.gen_range(-100.0..100.0);
+            // If we couldn't find a valid position after 100 attempts, use it anyway
+            // (shouldn't happen with reasonable num_aircraft)
+            positions.push((base_x, base_y, base_z));
             
-            // Give each aircraft a different heading (perpendicular to position vector)
-            // This ensures they move in different directions
-            let heading = angle + std::f64::consts::PI / 2.0 + rng.gen_range(-0.3..0.3);
-            let speed = rng.gen_range(80.0..120.0); // Reasonable aircraft speed
+            // Completely random velocity
+            let speed = rng.gen_range(50.0..150.0); // Random speed
+            let heading = rng.gen_range(0.0..2.0 * std::f64::consts::PI); // Random heading
             let vx = speed * heading.cos();
             let vy = speed * heading.sin();
-            let vz = rng.gen_range(-5.0..5.0);
+            let vz = rng.gen_range(-10.0..10.0); // Random vertical velocity
             
             let x = Vector6::new(
-                base_x + offset_x,
-                base_y + offset_y,
-                base_z + offset_z,
+                base_x,
+                base_y,
+                base_z,
                 vx,
                 vy,
                 vz,
