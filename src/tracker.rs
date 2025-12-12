@@ -169,8 +169,8 @@ impl Tracker {
         if self.tracks.is_empty() {
             // Initialize tracks from measurements (up to a limit)
             // Limit to a reasonable number based on expected targets
-            // For 2 aircraft, we should only initialize a few tracks (2-5)
-            let max_initial_tracks = 5; // Initialize up to 5 tracks initially
+            // For 2 aircraft, we should only initialize 2 tracks
+            let max_initial_tracks = 2; // Initialize up to 2 tracks initially for 2 aircraft
             log::info!("Initializing up to {} tracks from {} measurements", max_initial_tracks, measurements.len());
             for measurement in measurements.iter().take(max_initial_tracks) {
                 self.initialize_track(measurement, time);
@@ -694,8 +694,8 @@ impl Tracker {
         
         // Initialize tracks from unassociated measurements
         // Limit the number of new tracks per step to avoid explosion
-        // For 2 aircraft, limit to 2-3 new tracks per step
-        let max_new_tracks_per_step = 3; // Limit to 3 new tracks per step for 2 aircraft
+        // For 2 aircraft, limit to 1 new track per step
+        let max_new_tracks_per_step = 1; // Limit to 1 new track per step for 2 aircraft
         let num_to_initialize = unassociated_measurements.len().min(max_new_tracks_per_step);
         log::debug!("Found {} unassociated measurements, initializing up to {}", 
             unassociated_measurements.len(), num_to_initialize);
@@ -716,7 +716,7 @@ impl Tracker {
                     .par_iter()
                     .any(|track| {
                         let distance = (measurement.z - track.state.position()).magnitude();
-                        distance < 150.0 // If within 150m of existing track, too close (reduced from 200m)
+                        distance < 200.0 // If within 200m of existing track, too close
                     });
                 !too_close
             })
