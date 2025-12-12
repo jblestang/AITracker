@@ -167,6 +167,11 @@ impl AircraftSimulator {
         self.time
     }
     
+    /// Set phase timer (for randomization)
+    pub fn set_phase_timer(&mut self, timer: f64) {
+        self.phase_timer = timer;
+    }
+    
     /// Generate measurement with noise
     /// 
     /// # Arguments
@@ -363,8 +368,8 @@ impl ClutterGenerator {
 /// Combines aircraft simulation and clutter generation for a complete
 /// test environment.
 pub struct Simulation {
-    /// Aircraft simulator
-    pub aircraft: AircraftSimulator,
+    /// Aircraft simulators (one per trajectory)
+    pub aircraft: Vec<AircraftSimulator>,
     /// Clutter generator
     clutter_gen: ClutterGenerator,
     /// Measurement noise standard deviation
@@ -374,14 +379,74 @@ pub struct Simulation {
 }
 
 impl Simulation {
-    /// Create a new simulation
+    /// Create a new simulation with a single aircraft
     /// 
     /// # Arguments
     /// * `dt` - Time step
     /// * `measurement_noise_std` - Measurement noise standard deviation
     /// * `detection_prob` - Detection probability
     pub fn new(dt: f64, measurement_noise_std: f64, detection_prob: f64) -> Self {
-        let aircraft = AircraftSimulator::default(dt);
+        Self::new_with_num_aircraft(dt, measurement_noise_std, detection_prob, 1)
+    }
+    
+    /// Create a new simulation with multiple aircraft
+    /// 
+    /// # Arguments
+    /// * `dt` - Time step
+    /// * `measurement_noise_std` - Measurement noise standard deviation
+    /// * `detection_prob` - Detection probability
+    /// * `num_aircraft` - Number of aircraft to simulate
+    pub fn new_with_num_aircraft(
+        dt: f64, 
+        measurement_noise_std: f64, 
+        detection_prob: f64,
+        num_aircraft: usize,
+    ) -> Self {
+        let mut aircraft = Vec::new();
+        let mut rng = rand::thread_rng();
+        
+        // Generate aircraft with random initial positions and velocities
+        for i in 0..num_aircraft {
+            // Spread aircraft across a large area
+            // Use a grid-like distribution with some randomness
+            let grid_size = (num_aircraft as f64).sqrt().ceil() as usize;
+            let x_idx = i % grid_size;
+            let y_idx = i / grid_size;
+            
+            // Base position: spread in a 10km x 10km grid at altitude 5000m
+            let base_x = (x_idx as f64 - grid_size as f64 / 2.0) * 1000.0;
+            let base_y = (y_idx as f64 - grid_size as f64 / 2.0) * 1000.0;
+            let base_z = 5000.0;
+            
+            // Add random offset to avoid perfect grid
+            let offset_x = rng.gen_range(-500.0..500.0);
+            let offset_y = rng.gen_range(-500.0..500.0);
+            let offset_z = rng.gen_range(-200.0..200.0);
+            
+            // Random initial velocity (50-150 m/s magnitude)
+            let speed = rng.gen_range(50.0..150.0);
+            let heading = rng.gen_range(0.0..2.0 * std::f64::consts::PI);
+            let vx = speed * heading.cos();
+            let vy = speed * heading.sin();
+            let vz = rng.gen_range(-10.0..10.0);
+            
+            let x = Vector6::new(
+                base_x + offset_x,
+                base_y + offset_y,
+                base_z + offset_z,
+                vx,
+                vy,
+                vz,
+            );
+            let P = Matrix6::identity() * 1.0; // Small initial uncertainty
+            let initial_state = State::new(x, P);
+            
+            let mut simulator = AircraftSimulator::new(initial_state, dt);
+            // Randomize initial phase timer to avoid synchronized motion
+            simulator.set_phase_timer(rng.gen_range(0.0..10.0));
+            aircraft.push(simulator);
+        }
+        
         let clutter_gen = ClutterGenerator::default();
         
         Self {
@@ -394,31 +459,40 @@ impl Simulation {
     
     /// Step simulation forward
     /// 
-    /// Updates aircraft state and generates measurements (both true
+    /// Updates all aircraft states and generates measurements (both true
     /// and clutter).
     /// 
     /// # Returns
-    /// Tuple of (true state, measurements, time)
-    pub fn step(&mut self) -> (State, Vec<Measurement>, f64) {
-        // Update aircraft
-        self.aircraft.step();
-        let true_state = self.aircraft.true_state();
-        let time = self.aircraft.time();
-        
-        // Generate measurements
-        let mut measurements = Vec::new();
-        
-        // Clutter will be generated in visualization based on view bounds
-        // (moved to visualization for view-adaptive clutter)
-        
-        // Generate true measurement (with detection probability)
-        let mut rng = rand::thread_rng();
-        if rng.gen::<f64>() < self.detection_prob {
-            let true_measurement = self.aircraft.generate_measurement(self.measurement_noise_std);
-            measurements.push(true_measurement);
+    /// Tuple of (true states, measurements, time)
+    pub fn step(&mut self) -> (Vec<State>, Vec<Measurement>, f64) {
+        // Update all aircraft
+        for aircraft in &mut self.aircraft {
+            aircraft.step();
         }
         
-        (true_state, measurements, time)
+        // Get time from first aircraft (all should have same time)
+        let time = if let Some(first) = self.aircraft.first() {
+            first.time()
+        } else {
+            0.0
+        };
+        
+        // Generate measurements from all aircraft
+        let mut measurements = Vec::new();
+        let mut rng = rand::thread_rng();
+        
+        for aircraft in &mut self.aircraft {
+            // Generate true measurement (with detection probability)
+            if rng.gen::<f64>() < self.detection_prob {
+                let true_measurement = aircraft.generate_measurement(self.measurement_noise_std);
+                measurements.push(true_measurement);
+            }
+        }
+        
+        // Get all true states
+        let true_states: Vec<State> = self.aircraft.iter().map(|a| a.true_state()).collect();
+        
+        (true_states, measurements, time)
     }
     
     /// Generate clutter in specified bounds
@@ -443,14 +517,23 @@ impl Simulation {
         self.clutter_gen.generate_in_bounds(time, measurement_noise_std, _bounds_min, _bounds_max)
     }
     
-    /// Get current true state
+    /// Get current true states (all aircraft)
+    pub fn true_states(&self) -> Vec<State> {
+        self.aircraft.iter().map(|a| a.true_state()).collect()
+    }
+    
+    /// Get current true state (first aircraft, for backward compatibility)
     pub fn true_state(&self) -> State {
-        self.aircraft.true_state()
+        self.aircraft.first()
+            .map(|a| a.true_state())
+            .unwrap_or_else(|| State::zero())
     }
     
     /// Get current time
     pub fn time(&self) -> f64 {
-        self.aircraft.time()
+        self.aircraft.first()
+            .map(|a| a.time())
+            .unwrap_or(0.0)
     }
 }
 

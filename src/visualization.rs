@@ -22,6 +22,8 @@ pub struct TrackerApp {
     tracker: Tracker,
     /// History of true states
     true_history: Vec<State>,
+    /// Current true states for all aircraft
+    current_true_states: Vec<State>,
     /// History of track estimates
     track_history: Vec<State>,
     /// History of measurements
@@ -54,13 +56,15 @@ pub struct TrackerApp {
 impl Default for TrackerApp {
     fn default() -> Self {
         let dt = 1.0; // 1 second time step
-        let simulation = Simulation::new(dt, 10.0, 0.9);
+        // Create simulation with 1000 aircraft
+        let simulation = Simulation::new_with_num_aircraft(dt, 10.0, 0.9, 1000);
         let tracker = Tracker::new(dt);
         
         Self {
             simulation,
             tracker,
             true_history: Vec::new(),
+            current_true_states: Vec::new(),
             track_history: Vec::new(),
             measurement_history: Vec::new(),
             running: true, // Auto-play at startup
@@ -121,7 +125,15 @@ impl TrackerApp {
                 }
             }
             // Step simulation
-            let (true_state, measurements, time) = self.simulation.step();
+            let (true_states, measurements, time) = self.simulation.step();
+            
+            // Store current true states (for all aircraft)
+            self.current_true_states = true_states.clone();
+            
+            // For backward compatibility, also store first aircraft in history
+            if let Some(first_state) = true_states.first() {
+                self.true_history.push(*first_state);
+            }
             
             // Generate clutter in view bounds (view-adaptive)
             // This ensures clutter density is constant regardless of zoom level
@@ -131,8 +143,6 @@ impl TrackerApp {
             // Update tracker
             self.tracker.update(&measurements, time);
             
-            // Store history
-            self.true_history.push(true_state);
             self.measurement_history.push(measurements);
             
             // Store track estimate
@@ -140,11 +150,11 @@ impl TrackerApp {
                 self.track_history.push(track.state);
             }
             
-            // Auto-follow aircraft: update view center to follow current position
+            // Auto-follow aircraft: update view center to follow current position (first aircraft)
             if self.auto_follow {
-                if let Some(last_state) = self.true_history.last() {
+                if let Some(first_state) = self.current_true_states.first() {
                     // Smoothly follow the aircraft (use aircraft position as view center)
-                    self.view_center = last_state.position();
+                    self.view_center = first_state.position();
                     // Keep Z at a reasonable viewing height
                     self.view_center[2] = 5000.0;
                 }
@@ -186,23 +196,26 @@ impl TrackerApp {
         }
         
         // Draw true trajectory
-        if self.show_true && self.true_history.len() > 1 {
-            let mut points = Vec::new();
-            for state in &self.true_history {
-                points.push(to_screen(state.position()));
+        if self.show_true {
+            // Draw history for first aircraft (backward compatibility)
+            if self.true_history.len() > 1 {
+                let mut points = Vec::new();
+                for state in &self.true_history {
+                    points.push(to_screen(state.position()));
+                }
+                
+                if points.len() > 1 {
+                    painter.add(egui::Shape::line(
+                        points,
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 255, 0)),
+                    ));
+                }
             }
             
-            if points.len() > 1 {
-                painter.add(egui::Shape::line(
-                    points,
-                    egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 255, 0)),
-                ));
-            }
-            
-            // Draw current true position
-            if let Some(last_state) = self.true_history.last() {
-                let screen_pos = to_screen(last_state.position());
-                painter.circle_filled(screen_pos, 5.0, egui::Color32::from_rgb(0, 255, 0));
+            // Draw all current aircraft positions
+            for state in &self.current_true_states {
+                let screen_pos = to_screen(state.position());
+                painter.circle_filled(screen_pos, 3.0, egui::Color32::from_rgb(0, 255, 0));
             }
         }
         
@@ -234,7 +247,8 @@ impl TrackerApp {
         
         // Draw tracking error lines (connect true position to track estimate)
         if self.show_error_lines && self.show_true && self.show_track {
-            if let (Some(true_state), Some(track_state)) = (self.true_history.last(), self.track_history.last()) {
+            // Draw error lines for primary track (first aircraft)
+            if let (Some(true_state), Some(track_state)) = (self.current_true_states.first(), self.track_history.last()) {
                 let true_pos = to_screen(true_state.position());
                 let track_pos = to_screen(track_state.position());
                 
@@ -311,8 +325,19 @@ impl eframe::App for TrackerApp {
                             }
                             
                             // Tracking error if true state available
-                            if let Some(true_state) = self.true_history.last() {
-                                let error = (true_state.position() - track.state.position()).magnitude();
+                            // Find closest true state for this track
+                            let error = if let Some(closest_true) = self.current_true_states.iter()
+                                .min_by(|a, b| {
+                                    let dist_a = (a.position() - track.state.position()).magnitude();
+                                    let dist_b = (b.position() - track.state.position()).magnitude();
+                                    dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
+                                }) {
+                                (closest_true.position() - track.state.position()).magnitude()
+                            } else {
+                                0.0
+                            };
+                            
+                            if error > 0.0 {
                                 let error_color = if error < 50.0 {
                                     egui::Color32::from_rgb(0, 255, 0) // Green for good
                                 } else if error < 200.0 {
