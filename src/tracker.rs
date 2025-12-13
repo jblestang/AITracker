@@ -657,15 +657,23 @@ impl Tracker {
                 // Increase existence probability more aggressively when updated
                 track.existence_prob = (track.existence_prob * 0.9 + 0.1).min(1.0);
                 
-                // Add measurement to history for velocity estimation (M/N logic)
+                // Add measurement to history for velocity estimation and track confirmation
+                // Count this as a valid association for confirmation logic (3 valid associations needed)
+                // Since effective_update is true, this means the track was actually updated with a measurement
                 if let Some(best_meas_idx) = association_probs.iter()
                     .enumerate()
                     .skip(1)
                     .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                     .map(|(idx, _)| idx - 1)
                 {
-                    if best_meas_idx < measurements.len() && association_probs[best_meas_idx + 1] > 0.3 {
-                        track.add_measurement(measurements[best_meas_idx].z, time);
+                    if best_meas_idx < measurements.len() {
+                        // Count as valid association - effective_update means we have a valid association
+                        // Use a very low threshold (0.05) to count most associations, but still filter out noise
+                        if association_probs[best_meas_idx + 1] > 0.05 {
+                            track.add_measurement(measurements[best_meas_idx].z, time);
+                            log::debug!("[TRACK {}] Valid association #{} (prob={:.3})", 
+                                track.id, track.num_detections, association_probs[best_meas_idx + 1]);
+                        }
                     }
                 }
             } else {
@@ -684,11 +692,13 @@ impl Tracker {
             // Increment scan counter for M/N logic
             track.increment_scan();
             
-            // Check M/N confirmation (M=2 detections out of N=3 scans)
-            if !track.is_confirmed && track.should_confirm(2, 3) {
+            // NEW LOGIC: Track becomes active/confirmed after 3 valid associations
+            // A valid association means the track was actually updated (effective_update = true)
+            // This is tracked via num_detections which is incremented in add_measurement
+            if !track.is_confirmed && track.num_detections >= 3 {
                 track.is_confirmed = true;
-                log::info!("[TRACK CONFIRM] Track {} confirmed ({} detections in {} scans)", 
-                    track.id, track.num_detections, track.num_scans);
+                log::info!("[TRACK CONFIRM] Track {} confirmed after {} valid associations", 
+                    track.id, track.num_detections);
             }
             
             // Improve velocity estimation using measurement history (least-squares)
@@ -828,16 +838,15 @@ impl Tracker {
         let jpda_ref = &self.jpda;
         let dt = self.dt;
         
-        // Only consider confirmed tracks for association (M/N logic)
-        let confirmed_tracks: Vec<&Track> = tracks_ref.iter()
-            .filter(|track| track.is_confirmed)
-            .collect();
+        // Consider all tracks (both confirmed and pending) for association
+        // Pending tracks can also associate with measurements to become confirmed
+        let all_tracks: Vec<&Track> = tracks_ref.iter().collect();
         
         let unassociated_measurements: Vec<(usize, Measurement)> = measurements
             .par_iter()
             .enumerate()
             .filter_map(|(meas_idx, measurement)| {
-                let max_association: f64 = confirmed_tracks
+                let max_association: f64 = all_tracks
                     .par_iter()
                     .map(|track| {
                         let filter_for_gating: Box<dyn KalmanFilter> = get_filter(MotionModel::ConstantVelocity);
@@ -882,62 +891,46 @@ impl Tracker {
             })
             .collect();
         
-        // Initialize tracks from unassociated measurements
-        // Use expected number of targets from simulation
-        let expected_num_tracks = self.expected_num_targets;
+        // NEW LOGIC: Every unassociated measurement creates a new pending track
+        // Tracks become active/confirmed after 3 valid associations
+        log::info!("[TRACK INIT] Found {} unassociated measurements, {} existing tracks, creating pending tracks for all unassociated measurements", 
+            unassociated_measurements.len(), self.tracks.len());
         
-        if self.tracks.len() >= expected_num_tracks {
-            log::info!("[TRACK INIT] Already have {} tracks (expected {}), skipping new track creation", 
-                self.tracks.len(), expected_num_tracks);
-            return;
-        }
-        
-        // Limit the number of new tracks per step to avoid explosion
-        // Allow more new tracks per step for more targets (but still limit to prevent explosion)
-        let max_new_tracks_per_step = match expected_num_tracks {
-            1 => 1,
-            2 => 1,
-            3..=5 => 2, // Allow 2 new tracks per step for 3-5 targets
-            _ => 3, // Allow 3 for 6+ targets
-        };
-        let max_allowed_tracks = expected_num_tracks; // Don't exceed expected number
-        let remaining_slots = max_allowed_tracks.saturating_sub(self.tracks.len());
-        let num_to_initialize = unassociated_measurements.len()
-            .min(max_new_tracks_per_step)
-            .min(remaining_slots);
-        
-        log::info!("[TRACK INIT] Found {} unassociated measurements, {} existing tracks, initializing up to {} new tracks", 
-            unassociated_measurements.len(), self.tracks.len(), num_to_initialize);
-        
-        // Parallelize distance checking for remaining measurements
+        // Check distance to existing tracks to avoid duplicates
+        // Only create track if measurement is far enough from existing tracks
+        let min_separation = 200.0; // Minimum 200m separation to avoid duplicate tracks
         let tracks_ref = &self.tracks;
-        let measurements_to_check: Vec<Measurement> = unassociated_measurements
+        
+        // Filter measurements that are far enough from existing tracks
+        let measurements_to_initialize: Vec<Measurement> = unassociated_measurements
             .iter()
-            .take(num_to_initialize)
-            .map(|(_, m)| m.clone())
-            .collect();
-        
-        let valid_measurements: Vec<Measurement> = measurements_to_check
-            .par_iter()
-            .filter(|measurement| {
-                // Check if measurement is not too close to any existing track
-                let too_close = tracks_ref
-                    .par_iter()
-                    .any(|track| {
-                        let distance = (measurement.z - track.state.position()).magnitude();
-                        distance < 200.0 // If within 200m of existing track, too close
-                    });
-                !too_close
+            .filter_map(|(meas_idx, measurement)| {
+                // Check distance to all existing tracks (both confirmed and pending)
+                let is_far_enough = tracks_ref.iter().all(|track| {
+                    let track_pos = track.state.position();
+                    (measurement.z - track_pos).magnitude() >= min_separation
+                });
+                
+                if is_far_enough {
+                    log::debug!("[TRACK INIT] Creating pending track from measurement {} at ({:.1}, {:.1}, {:.1})", 
+                        meas_idx, measurement.z[0], measurement.z[1], measurement.z[2]);
+                    Some(measurement.clone())
+                } else {
+                    log::debug!("[TRACK INIT] Skipping measurement {} - too close to existing track", meas_idx);
+                    None
+                }
             })
-            .cloned()
             .collect();
         
-        // Initialize tracks from valid measurements
-        for measurement in valid_measurements {
-            log::info!("[TRACK INIT] Initializing new track {} from unassociated measurement at ({:.1}, {:.1}, {:.1})", 
-                self.tracks.len() + 1, measurement.z[0], measurement.z[1], measurement.z[2]);
+        // Initialize tracks from all valid measurements (every unassociated measurement creates a pending track)
+        for measurement in measurements_to_initialize {
+            log::info!("[TRACK INIT] Creating pending track {} from unassociated measurement at ({:.1}, {:.1}, {:.1})", 
+                self.next_track_id, measurement.z[0], measurement.z[1], measurement.z[2]);
             self.initialize_track(&measurement, time);
-            log::info!("[TRACK INIT] Now have {} tracks total", self.tracks.len());
+            log::info!("[TRACK INIT] Now have {} tracks total ({} pending, {} confirmed)", 
+                self.tracks.len(), 
+                self.tracks.iter().filter(|t| !t.is_confirmed).count(),
+                self.tracks.iter().filter(|t| t.is_confirmed).count());
         }
     }
     
