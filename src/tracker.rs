@@ -319,7 +319,8 @@ impl Tracker {
             // Reset previous track state when initializing new tracks
             self.prev_track_state = None;
             self.prev_track_position = None;
-            return; // Return early on first initialization
+            // DON'T return early - continue to process remaining measurements for additional tracks
+            // The initial creation might not have created all expected tracks if measurements were too close
         }
         
         log::info!("[TRACK UPDATE] Updating {} existing tracks with {} measurements", 
@@ -982,7 +983,9 @@ impl Tracker {
         // 2. Track score threshold (filter likely clutter)
         // 3. Velocity validation (reasonable speeds)
         
-        let min_track_score = -1.0; // Minimum score to initialize track (filters out poor measurements)
+        // More lenient score threshold for initial tracks
+        // Since we're already filtering by distance and unassociation, we can be less strict
+        let min_track_score = 0.0; // Minimum score to initialize track (more lenient)
         let prev_meas_ref = &self.prev_measurement;
         let jpda_pd = self.jpda.pd;
         let jpda_lambda_fa = self.jpda.lambda_fa;
@@ -1002,36 +1005,45 @@ impl Tracker {
                 }
                 
                 // Compute track score (log-likelihood ratio)
+                // CRITICAL FIX: Don't use shared prev_measurement for velocity validation
+                // because it's from a different target. Instead, use a more lenient approach
+                // for initial track creation.
                 let mut score = 0.0;
                 
-                // If we have a previous measurement, estimate velocity and validate
+                // For initial track creation, we can't reliably compute velocity from
+                // a shared previous measurement (it might be from a different aircraft).
+                // Instead, use a more lenient scoring approach:
+                // - If we have existing tracks, this measurement is far enough away (already checked)
+                // - Give it a base score that allows initialization
+                // - Velocity validation will happen after the track is created and gets updates
+                
+                // Base score for measurements that are unassociated and far from existing tracks
+                // This indicates they're likely from a new target
+                score += 1.0; // Base score for being unassociated and separated
+                
+                // If we have a previous measurement AND it's close in time, we can do basic validation
+                // But be lenient - the previous measurement might be from a different target
                 if let Some(prev_meas) = prev_meas_ref {
                     let dt = (measurement.time - prev_meas.time).max(0.1);
-                    if dt > 0.0 && dt < 10.0 {
+                    if dt > 0.0 && dt < 2.0 { // Only use if very recent (same scan)
                         let estimated_velocity = (measurement.z - prev_meas.z) / dt;
                         let speed = estimated_velocity.magnitude();
                         
                         // Velocity gate: reasonable aircraft speeds (0-300 m/s ≈ 0-1080 km/h)
-                        if speed > 0.0 && speed < 300.0 {
+                        // But be lenient - this might be from a different target
+                        if speed > 0.0 && speed < 500.0 { // More lenient upper bound
                             // Score based on how reasonable the speed is
                             if speed >= 50.0 && speed <= 250.0 {
-                                score += 2.0; // Good speed range
+                                score += 1.0; // Good speed range (bonus)
                             } else if speed >= 20.0 && speed < 50.0 {
-                                score += 1.0; // Slow but possible
-                            } else if speed > 250.0 && speed < 300.0 {
-                                score += 1.0; // Fast but possible
-                            } else {
-                                score -= 1.0; // Unlikely speed
+                                score += 0.5; // Slow but possible
+                            } else if speed > 250.0 && speed < 500.0 {
+                                score += 0.5; // Fast but possible (supersonic aircraft)
                             }
-                        } else {
-                            // Unreasonable speed - likely clutter
-                            return None; // Skip this measurement
+                            // Don't penalize other speeds - might be from different target
                         }
+                        // Don't reject based on velocity - might be from different target
                     }
-                } else {
-                    // No previous measurement - isolated measurement
-                    // Lower score (more likely to be clutter)
-                    score -= 1.0;
                 }
                 
                 // Account for clutter density
@@ -1059,14 +1071,18 @@ impl Tracker {
         sorted_measurements.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         
         // Limit number of new tracks per step to prevent explosion
-        // Allow more for more targets, but still limit
+        // But allow enough to create all expected targets
         let max_new_tracks_per_step = match self.expected_num_targets {
-            1..=2 => 2,  // Allow 2 new tracks per step for 1-2 targets
-            3..=5 => 3,  // Allow 3 for 3-5 targets
-            _ => 5,      // Allow 5 for 6+ targets
+            1..=2 => 3,  // Allow 3 new tracks per step for 1-2 targets (some margin)
+            3..=5 => 5,  // Allow 5 for 3-5 targets
+            _ => 10,     // Allow 10 for 6+ targets
         };
         
-        let num_to_initialize = sorted_measurements.len().min(max_new_tracks_per_step);
+        // Also limit by how many tracks we still need
+        let tracks_needed = self.expected_num_targets.saturating_sub(self.tracks.len());
+        let num_to_initialize = sorted_measurements.len()
+            .min(max_new_tracks_per_step)
+            .min(tracks_needed.max(1)); // Always allow at least 1 if available
         
         for (measurement, score) in sorted_measurements.into_iter().take(num_to_initialize) {
             log::info!("[TRACK INIT] Creating pending track {} from measurement at ({:.1}, {:.1}, {:.1}) with score={:.2}", 
