@@ -133,6 +133,8 @@ pub struct Track {
     pub num_scans: usize,
     /// Measurement history for velocity estimation (last 3 measurements)
     pub measurement_history: Vec<(Vector3<f64>, f64)>, // (position, time)
+    /// Previous position and time for velocity estimation (track-specific)
+    pub prev_position: Option<(Vector3<f64>, f64)>,
 }
 
 impl Track {
@@ -153,6 +155,7 @@ impl Track {
             num_detections: 0,
             num_scans: 0,
             measurement_history: Vec::new(),
+            prev_position: None,
         }
     }
     

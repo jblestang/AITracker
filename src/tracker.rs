@@ -262,11 +262,14 @@ impl Tracker {
         
         // Check for conflicts when multiple tracks associate with the same measurement
         // Use joint probabilities to resolve conflicts properly
+        // FIX: Remove measurement count requirement - conflicts can occur with 1 measurement
+        // FIX: Pre-compute associations once and reuse them
         let mut resolved_associations: Option<Vec<Vec<f64>>> = None;
-        if self.tracks.len() >= 2 && measurements.len() >= 2 {
-            // Pre-compute association probabilities for all tracks to detect conflicts
+        let mut initial_associations: Vec<Vec<f64>> = Vec::new();
+        
+        if !measurements.is_empty() {
+            // Pre-compute association probabilities for all tracks (always, for reuse)
             let filter_for_gating: Box<dyn KalmanFilter> = get_filter(MotionModel::ConstantVelocity);
-            let mut initial_associations: Vec<Vec<f64>> = Vec::new();
             for track in &self.tracks {
                 let assoc_probs = self.jpda.compute_association_probs(
                     track,
@@ -276,6 +279,9 @@ impl Tracker {
                 );
                 initial_associations.push(assoc_probs);
             }
+        }
+        
+        if self.tracks.len() >= 2 && !measurements.is_empty() {
             
             // Check for conflicts: multiple tracks associating with same measurement
             // Adaptive threshold: lower for more tracks (more competition)
@@ -339,14 +345,19 @@ impl Tracker {
                                                self.tracks[*track_idx].missed_detections < 3;
                         let consistency_bonus = if track_consistent { 1.2 } else { 1.0 };
                         
-                        // Penalize tracks that already have good assignments (for 3+ tracks)
+                        // FIX: Prioritize tracks without assignments, penalize tracks with assignments
+                        let assignment_bonus = if self.tracks.len() >= 3 && !track_has_good_assignment[*track_idx] {
+                            1.3 // Bonus for tracks without assignments (30% boost)
+                        } else {
+                            1.0
+                        };
                         let assignment_penalty = if self.tracks.len() >= 3 && track_has_good_assignment[*track_idx] {
                             0.7 // Reduce score if track already has a good assignment
                         } else {
                             1.0
                         };
                         
-                        let adjusted_score = likelihood * consistency_bonus * assignment_penalty;
+                        let adjusted_score = likelihood * consistency_bonus * assignment_bonus * assignment_penalty;
                         track_scores.push((*track_idx, adjusted_score, likelihood, *assoc_prob));
                     }
                     
@@ -404,8 +415,11 @@ impl Tracker {
                 resolved_associations = Some(resolved);
             } else {
                 // No conflict detected, use original associations
-                resolved_associations = Some(initial_associations);
+                resolved_associations = Some(initial_associations.clone());
             }
+        } else {
+            // Single track or no measurements: use pre-computed associations
+            resolved_associations = Some(initial_associations.clone());
         }
         
         // Update existing tracks
@@ -419,13 +433,17 @@ impl Tracker {
             // Get filters for each model
             let models = MotionModel::all();
             
-            // Compute association probabilities using combined state for gating
+            // FIX: Reuse pre-computed association probabilities from conflict detection
+            // This avoids double computation and ensures consistency
             let filter_for_gating: Box<dyn KalmanFilter> = get_filter(MotionModel::ConstantVelocity);
             let mut association_probs = if let Some(ref resolved) = resolved_associations {
                 // Use resolved associations if available (for conflict resolution)
                 resolved[track_idx].clone()
+            } else if track_idx < initial_associations.len() {
+                // Reuse pre-computed associations from conflict detection phase
+                initial_associations[track_idx].clone()
             } else {
-                // Normal case: compute associations independently
+                // Fallback: compute associations independently (shouldn't happen normally)
                 self.jpda.compute_association_probs(
                     track,
                     measurements,
@@ -566,10 +584,9 @@ impl Tracker {
             track.id, old_pos[0], old_pos[1], old_pos[2], 
             new_pos[0], new_pos[1], new_pos[2], pos_change);
         
-        // Improve velocity estimation using position history
-        // Note: We use prev_track_position which may be from a different track,
-        // but this is the current design
-        if let Some((prev_pos, prev_time)) = &self.prev_track_position {
+        // FIX: Use track-specific previous position for velocity estimation
+        // This fixes the bug where all tracks used the last track's position
+        if let Some((prev_pos, prev_time)) = &track.prev_position {
             let dt_actual = (time - prev_time).max(0.1);
             
             if dt_actual > 0.0 && dt_actual < 10.0 {
@@ -627,9 +644,10 @@ impl Tracker {
             track.age += 1;
             track.last_update_time = time;
             
+            // FIX: Store track-specific previous position (not shared across tracks)
             // Store current state and position for next velocity estimation
             self.prev_track_state = Some(combined_state);
-            self.prev_track_position = Some((combined_state.position(), time));
+            track.prev_position = Some((combined_state.position(), time));
             
             // Store updated model states
             self.model_states[track_idx] = updated_model_states;
