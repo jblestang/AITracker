@@ -1072,10 +1072,14 @@ impl Tracker {
         
         // Limit number of new tracks per step to prevent explosion
         // But allow enough to create all expected targets
+        // Scale with expected targets to handle large numbers of aircraft
         let max_new_tracks_per_step = match self.expected_num_targets {
-            1..=2 => 3,  // Allow 3 new tracks per step for 1-2 targets (some margin)
-            3..=5 => 5,  // Allow 5 for 3-5 targets
-            _ => 10,     // Allow 10 for 6+ targets
+            1..=2 => 3,           // Allow 3 new tracks per step for 1-2 targets
+            3..=5 => 5,           // Allow 5 for 3-5 targets
+            6..=10 => 10,         // Allow 10 for 6-10 targets
+            11..=20 => 20,        // Allow 20 for 11-20 targets
+            21..=50 => 30,        // Allow 30 for 21-50 targets
+            _ => 50,              // Allow 50 for 50+ targets (very large scenarios)
         };
         
         // Also limit by how many tracks we still need
